@@ -249,10 +249,28 @@ class LeaseRef(models.Model):
     """Read-only reference onto units-backend's Lease table.
 
     One hop toward the PMC from `LeaseTransactionRef.lease_id` (Design Notes).
+
+    Story 2.6 adds `security_deposit` and `lease_status`: this story's
+    trigger IS the `Lease` row itself (a new `post_save` signal, not a
+    `LeaseTransaction`), so `post_security_deposit` reads the posting
+    decision (`lease_status == "ACTIVE"` and `security_deposit` non-null/
+    non-zero) directly off this ref model instead of a `LeaseTransactionRef`
+    hop.
     """
 
     unit_id = models.BigIntegerField(
         help_text="units-backend Unit.id — not a cross-DB FK (next hop toward the PMC)."
+    )
+    security_deposit = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="units-backend Lease.security_deposit -- Story 2.6's posting amount.",
+    )
+    lease_status = models.CharField(
+        max_length=20,
+        null=True,
+        blank=True,
+        help_text="units-backend Lease.lease_status -- Story 2.6 posts only when 'ACTIVE'.",
     )
 
     class Meta:

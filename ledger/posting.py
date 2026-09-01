@@ -106,6 +106,35 @@ from ledger.models import (
     UnitRef,
 )
 
+"""
+Story 2.6: Security deposit posting.
+
+`post_security_deposit` posts a Journal Entry (debit Bank, credit Security
+Deposits Held) when a `Lease` row's CURRENT `lease_status == "ACTIVE"` and
+`security_deposit` is non-null and non-zero. Unlike every other posting
+function in this module, the trigger is NOT a `LeaseTransaction` at all --
+units-backend's second-ever signal fires a `post_save` on `Lease` itself
+(spec Intent), so this function starts directly from `LeaseRef` rather than
+walking in from a `LeaseTransactionRef.lease_id` hop (Design Notes: "one hop
+shorter").
+
+Idempotency key is the fixed pseudo-transition `(lease_id, "ACTIVATE")` --
+deliberately coarser than every other function's inferred from/to status
+pair, since `Lease` carries no per-row transition history to infer a "from"
+status from (Design Notes). This treats deposit-posting as a one-time-per-
+lease accounting fact: once posted, it is never re-posted, even if
+`lease_status` later cycles INACTIVE/EXPIRED and back to ACTIVE (spec
+Boundaries & Constraints).
+"""
+
+SECURITY_DEPOSITS_HELD_ACCOUNT_NAME = "Security Deposits Held"
+
+LEASE_STATUS_ACTIVE = "ACTIVE"
+
+# Fixed pseudo-transition -- not a real from/to status pair (Design Notes).
+# One deposit posting per lease, ever, keyed only on lease_id.
+DEPOSIT_ACTIVATE_TRANSITION = "ACTIVATE"
+
 logger = logging.getLogger(__name__)
 
 RENT_CHEQUE = "RENT_CHEQUE"
@@ -1042,5 +1071,165 @@ def post_bounce_fee(lease_transaction_id, txn=None):
         profile.pmc_id,
         fee_amount,
         vat_amount,
+    )
+    return {"posted": True, "reason": ""}
+
+
+def post_security_deposit(lease_id, lease=None):
+    """Post a balanced security deposit Journal Entry for an ACTIVE Lease.
+
+    `lease` may be passed in by a caller that has already fetched the
+    `LeaseRef` (e.g. `sync_lease`, which must inspect `lease_status`/
+    `security_deposit` before deciding whether to post at all) -- avoids a
+    second, redundant query for the same row. If omitted, this function
+    fetches it itself (e.g. for direct/test callers).
+
+    Trigger (spec Boundaries & Constraints): on the CURRENT `Lease` row,
+    `lease_status == "ACTIVE"` AND `security_deposit` is not null and not
+    zero. Any other state (not yet ACTIVE, or ACTIVE with no deposit) is a
+    genuine no-op -- wait, not a failure -- since every `Lease.save()` fires
+    this signal, and re-syncs of a still-DRAFT or already-posted lease are
+    expected and frequent.
+
+    Idempotency key is the fixed pseudo-transition `(lease_id, "ACTIVATE")`
+    -- NOT an inferred from/to status pair (Design Notes: `Lease` carries no
+    per-row transition history to infer one from). One deposit posting per
+    lease, ever, regardless of `lease_status` cycling back to INACTIVE/
+    EXPIRED and returning to ACTIVE later.
+
+    Returns a dict: {"posted": bool, "reason": str} -- same shape/contract as
+    every other posting function in this module. Never raises for an
+    expected failure path; only a genuinely unexpected DB error propagates
+    out of the atomic block.
+    """
+    if lease is None:
+        lease = LeaseRef.objects.filter(pk=lease_id).first()
+    if lease is None:
+        logger.error(
+            "post_security_deposit: no Lease found for id=%s -- cannot post",
+            lease_id,
+        )
+        return {"posted": False, "reason": "lease_not_found"}
+
+    if lease.lease_status != LEASE_STATUS_ACTIVE:
+        # Not yet active -- correctly a no-op, not a failure (steady state:
+        # every Lease.save() fires this signal, most of which aren't
+        # activations at all).
+        return {"posted": False, "reason": "not_active"}
+
+    if not lease.security_deposit:
+        # ACTIVE but no deposit amount (null or zero) -- correctly a no-op,
+        # not a failure (spec Never: never post when security_deposit is
+        # null or zero).
+        return {"posted": False, "reason": "no_deposit_amount"}
+
+    if JournalEntry.objects.filter(
+        source_lease_transaction_id=lease_id,
+        source_status_transition=DEPOSIT_ACTIVATE_TRANSITION,
+    ).exists():
+        logger.info(
+            "post_security_deposit: JournalEntry already exists for "
+            "lease_id=%s transition=%s -- skipping duplicate post "
+            "(already posted once, ever -- includes re-activation cycles)",
+            lease_id,
+            DEPOSIT_ACTIVATE_TRANSITION,
+        )
+        return {"posted": False, "reason": "duplicate_skip"}
+
+    # PMC resolution chain starts directly from LeaseRef.unit_id -- one hop
+    # shorter than post_rent_ar/post_cheque_clearing/post_bounce_reversal,
+    # which all start from a LeaseTransactionRef.lease_id hop (Design
+    # Notes). This story's trigger already IS the Lease row.
+    unit = UnitRef.objects.filter(pk=lease.unit_id).first()
+    if unit is None:
+        logger.error(
+            "post_security_deposit: unresolvable PMC for lease_id=%s -- "
+            "no Unit found for unit_id=%s",
+            lease_id,
+            lease.unit_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    property_ = PropertyRef.objects.filter(pk=unit.parent_property_id).first()
+    if property_ is None:
+        logger.error(
+            "post_security_deposit: unresolvable PMC for lease_id=%s -- "
+            "no Property found for parent_property_id=%s",
+            lease_id,
+            unit.parent_property_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    profile = FinancePMCProfile.objects.filter(pmc_id=property_.pmc_id).first()
+    if profile is None:
+        logger.error(
+            "post_security_deposit: unresolvable PMC for lease_id=%s -- "
+            "no FinancePMCProfile found for pmc_id=%s",
+            lease_id,
+            property_.pmc_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    amount = lease.security_deposit
+
+    try:
+        bank_account = Account.objects.get(
+            finance_pmc_profile=profile, name=BANK_ACCOUNT_NAME
+        )
+        security_deposits_held_account = Account.objects.get(
+            finance_pmc_profile=profile, name=SECURITY_DEPOSITS_HELD_ACCOUNT_NAME
+        )
+    except Account.DoesNotExist:
+        logger.error(
+            "post_security_deposit: Chart of Accounts not configured for "
+            "FinancePMCProfile pmc_id=%s (lease_id=%s) -- expected Accounts "
+            "named %r and %r",
+            profile.pmc_id,
+            lease_id,
+            BANK_ACCOUNT_NAME,
+            SECURITY_DEPOSITS_HELD_ACCOUNT_NAME,
+        )
+        return {"posted": False, "reason": "chart_of_accounts_not_configured"}
+
+    with transaction.atomic():
+        entry = JournalEntry.objects.create(
+            finance_pmc_profile=profile,
+            source_lease_transaction_id=lease_id,
+            source_status_transition=DEPOSIT_ACTIVATE_TRANSITION,
+        )
+
+        # Debit Bank, credit Security Deposits Held (a liability) -- never
+        # Rent Income, under any circumstance (spec Never).
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=bank_account,
+            debit=amount,
+            credit=0,
+        )
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=security_deposits_held_account,
+            debit=0,
+            credit=amount,
+        )
+
+        debit_total = sum(line.debit for line in entry.lines.all())
+        credit_total = sum(line.credit for line in entry.lines.all())
+        if debit_total != credit_total or debit_total != amount:
+            # Explicit if/raise balance check -- never `assert` (NFR-1).
+            # Raising here rolls back the whole atomic block.
+            raise ValueError(
+                f"post_security_deposit: unbalanced entry for lease_id="
+                f"{lease_id} (debit={debit_total}, credit={credit_total}, "
+                f"amount={amount})"
+            )
+
+    logger.info(
+        "post_security_deposit: posted JournalEntry id=%s for lease_id=%s "
+        "(pmc_id=%s, amount=%s)",
+        entry.id,
+        lease_id,
+        profile.pmc_id,
+        amount,
     )
     return {"posted": True, "reason": ""}

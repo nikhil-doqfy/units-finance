@@ -13,6 +13,12 @@ call, each independently no-oping when its own trigger condition isn't met
 `post_bounce_fee` alongside all three -- also not gated on cheque_type at
 the view level (its own `cheque_type == OTHER_CHARGE` check lives inside
 the function itself, same pattern as the others' internal gates).
+
+Story 2.6 adds `sync_lease`, a SEPARATE view parallel to
+`sync_lease_transaction` (not merged into it -- different source model,
+different units-backend signal). It receives units-backend's second-ever
+signal (a `post_save` on `Lease`, not `LeaseTransaction`) and calls
+`post_security_deposit`.
 """
 from rest_framework.decorators import api_view
 
@@ -23,8 +29,9 @@ from ledger.posting import (
     post_bounce_reversal,
     post_cheque_clearing,
     post_rent_ar,
+    post_security_deposit,
 )
-from ledger.models import LeaseTransactionRef
+from ledger.models import LeaseRef, LeaseTransactionRef
 from ledger.response_envelope import prepare_response
 
 
@@ -92,5 +99,51 @@ def sync_lease_transaction(request, lease_transaction_id):
             **({"posting": posting_results} if posting_results else {}),
         },
         message="Lease transaction sync acknowledged",
+        status=200,
+    )
+
+
+@api_view(["POST"])
+@require_internal_token
+def sync_lease(request, lease_id):
+    body_id = request.data.get("lease_id")
+
+    if body_id is not None:
+        try:
+            body_id = int(body_id)
+        except (TypeError, ValueError):
+            return prepare_response(
+                content={"body_lease_id": body_id},
+                message="lease_id in the request body is not a valid integer",
+                status=400,
+            )
+
+    if body_id is not None and body_id != lease_id:
+        return prepare_response(
+            content={
+                "path_lease_id": lease_id,
+                "body_lease_id": body_id,
+            },
+            message="lease_id in URL path does not match the request body",
+            status=400,
+        )
+
+    lease = LeaseRef.objects.filter(pk=lease_id).first()
+    posting_results = {}
+    if lease is not None:
+        # Same non-5xx, logged-outcome contract as sync_lease_transaction --
+        # unresolvable-PMC and duplicate-skip (and "not active"/"no deposit
+        # amount") are all Finance-side data/steady-state outcomes, not
+        # caller errors.
+        posting_results["security_deposit"] = post_security_deposit(
+            lease_id, lease=lease
+        )
+
+    return prepare_response(
+        content={
+            "lease_id": lease_id,
+            **({"posting": posting_results} if posting_results else {}),
+        },
+        message="Lease sync acknowledged",
         status=200,
     )

@@ -2,7 +2,7 @@
 from django.contrib import admin
 from django.urls import path
 
-from ledger.views import sync_lease_transaction
+from ledger.views import sync_lease, sync_lease_transaction
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -21,5 +21,19 @@ urlpatterns = [
         'internal/lease-transactions/<int:lease_transaction_id>/sync',
         sync_lease_transaction,
         name='sync-lease-transaction-no-slash',
+    ),
+    # Story 2.6: mirrors the lease-transactions naming precedent above --
+    # same trailing-slash + no-trailing-slash pair, since units-backend's
+    # real sender (lease/finance_sync.py's sync_lease_to_finance) also posts
+    # without a trailing slash.
+    path(
+        'internal/leases/<int:lease_id>/sync/',
+        sync_lease,
+        name='sync-lease',
+    ),
+    path(
+        'internal/leases/<int:lease_id>/sync',
+        sync_lease,
+        name='sync-lease-no-slash',
     ),
 ]

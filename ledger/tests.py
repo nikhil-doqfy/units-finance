@@ -28,6 +28,7 @@ from ledger.posting import (
     post_bounce_reversal,
     post_cheque_clearing,
     post_rent_ar,
+    post_security_deposit,
 )
 from ledger.seed import STANDARD_CHART_OF_ACCOUNTS
 
@@ -516,7 +517,9 @@ class PostRentArTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS lease_lease (
                     id BIGSERIAL PRIMARY KEY,
-                    unit_id BIGINT
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
                 )
                 """
             )
@@ -827,7 +830,9 @@ class PostChequeClearingTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS lease_lease (
                     id BIGSERIAL PRIMARY KEY,
-                    unit_id BIGINT
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
                 )
                 """
             )
@@ -1189,7 +1194,9 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS lease_lease (
                     id BIGSERIAL PRIMARY KEY,
-                    unit_id BIGINT
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
                 )
                 """
             )
@@ -1329,7 +1336,9 @@ class PostBounceReversalTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS lease_lease (
                     id BIGSERIAL PRIMARY KEY,
-                    unit_id BIGINT
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
                 )
                 """
             )
@@ -1825,7 +1834,9 @@ class PostBounceFeeTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS lease_lease (
                     id BIGSERIAL PRIMARY KEY,
-                    unit_id BIGINT
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
                 )
                 """
             )
@@ -2419,3 +2430,517 @@ class PostBounceFeeTests(TestCase):
                 source_status_transition="BOUNCE_FEE-FOR-480",
             ).exists()
         )
+
+
+class PostSecurityDepositTests(TestCase):
+    """Story 2.6 tests: post_security_deposit posting logic.
+
+    Extends the hand-rolled stand-in-table technique used throughout this
+    module (Story 1.2/2.2b's precedent) to `lease_lease` (with the new
+    `lease_status`/`security_deposit` columns) -> `property_unit` ->
+    `property_property`, exercising the real one-hop-shorter chain-walking
+    code path (starting directly from LeaseRef.unit_id, no
+    LeaseTransactionRef hop) without importing units-backend.
+
+    Covers all six I/O matrix rows from the spec:
+      1. Lease activates with a deposit -- ACTIVE + non-zero deposit posts
+         a balanced entry (debit Bank, credit Security Deposits Held).
+      2. Not yet active -- DRAFT posts nothing, no error.
+      3. Active but no deposit -- ACTIVE + null/zero deposit posts nothing,
+         no error.
+      4. Duplicate sync -- same eligible state synced twice is a no-op the
+         second time, exactly one JournalEntry.
+      5. Re-activation after INACTIVE -- posted once, cycles to INACTIVE
+         then back to ACTIVE, no second JournalEntry (the (lease_id,
+         "ACTIVATE") key already exists).
+      6. Unresolvable PMC -- broken Unit/Property/FinancePMCProfile chain
+         fails loudly, no partial post.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_lease (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS lease_lease")
+            cursor.execute("DROP TABLE IF EXISTS property_unit")
+            cursor.execute("DROP TABLE IF EXISTS property_property")
+        super().tearDownClass()
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            for table in ("lease_lease", "property_unit", "property_property"):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _insert_chain(
+        self,
+        cursor,
+        lease_id,
+        unit_id,
+        property_id,
+        pmc_id,
+        lease_status="ACTIVE",
+        security_deposit=5000,
+        skip_unit=False,
+        skip_property=False,
+        null_parent_property_id=False,
+        null_pmc_id=False,
+    ):
+        cursor.execute(
+            "INSERT INTO lease_lease (id, unit_id, lease_status, security_deposit) "
+            "VALUES (%s, %s, %s, %s)",
+            [lease_id, unit_id, lease_status, security_deposit],
+        )
+        if not skip_unit:
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [unit_id, None if null_parent_property_id else property_id],
+            )
+        if not skip_property:
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [property_id, None if null_pmc_id else pmc_id],
+            )
+
+    def _set_lease(self, cursor, lease_id, lease_status=None, security_deposit=None):
+        fields = []
+        params = []
+        if lease_status is not None:
+            fields.append("lease_status = %s")
+            params.append(lease_status)
+        if security_deposit is not None or security_deposit == 0:
+            fields.append("security_deposit = %s")
+            params.append(security_deposit)
+        params.append(lease_id)
+        cursor.execute(
+            f"UPDATE lease_lease SET {', '.join(fields)} WHERE id = %s", params
+        )
+
+    def _make_profile(self, pmc_id=1):
+        return FinancePMCProfile.objects.create(
+            pmc_id=pmc_id,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+    def test_lease_activates_with_deposit_posts_balanced_entry(self):
+        profile = self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=600,
+                unit_id=70,
+                property_id=80,
+                pmc_id=1,
+                lease_status="ACTIVE",
+                security_deposit=5000,
+            )
+
+        result = post_security_deposit(600)
+
+        self.assertTrue(result["posted"])
+        entries = JournalEntry.objects.filter(
+            source_lease_transaction_id=600,
+            source_status_transition="ACTIVATE",
+        )
+        self.assertEqual(entries.count(), 1)
+        entry = entries.first()
+        self.assertEqual(entry.finance_pmc_profile_id, profile.id)
+
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 2)
+
+        bank_line = lines.get(account__name="Bank")
+        deposit_line = lines.get(account__name="Security Deposits Held")
+        self.assertEqual(bank_line.debit, 5000)
+        self.assertEqual(bank_line.credit, 0)
+        self.assertEqual(deposit_line.debit, 0)
+        self.assertEqual(deposit_line.credit, 5000)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 5000)
+
+    def test_not_yet_active_posts_nothing(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=601,
+                unit_id=71,
+                property_id=81,
+                pmc_id=1,
+                lease_status="DRAFT",
+                security_deposit=5000,
+            )
+
+        result = post_security_deposit(601)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "not_active")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=601).count(), 0
+        )
+
+    def test_active_with_null_deposit_posts_nothing(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=602,
+                unit_id=72,
+                property_id=82,
+                pmc_id=1,
+                lease_status="ACTIVE",
+                security_deposit=None,
+            )
+
+        result = post_security_deposit(602)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_deposit_amount")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=602).count(), 0
+        )
+
+    def test_active_with_zero_deposit_posts_nothing(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=603,
+                unit_id=73,
+                property_id=83,
+                pmc_id=1,
+                lease_status="ACTIVE",
+                security_deposit=0,
+            )
+
+        result = post_security_deposit(603)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_deposit_amount")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=603).count(), 0
+        )
+
+    def test_duplicate_sync_is_skipped(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=604,
+                unit_id=74,
+                property_id=84,
+                pmc_id=1,
+                lease_status="ACTIVE",
+                security_deposit=3000,
+            )
+
+        first = post_security_deposit(604)
+        second = post_security_deposit(604)
+
+        self.assertTrue(first["posted"])
+        self.assertFalse(second["posted"])
+        self.assertEqual(second["reason"], "duplicate_skip")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=604).count(), 1
+        )
+
+    def test_reactivation_after_inactive_does_not_repost(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=605,
+                unit_id=75,
+                property_id=85,
+                pmc_id=1,
+                lease_status="ACTIVE",
+                security_deposit=4000,
+            )
+
+        first = post_security_deposit(605)
+        self.assertTrue(first["posted"])
+
+        with connection.cursor() as cursor:
+            self._set_lease(cursor, 605, lease_status="INACTIVE")
+        cycled_out = post_security_deposit(605)
+        self.assertFalse(cycled_out["posted"])
+        self.assertEqual(cycled_out["reason"], "not_active")
+
+        with connection.cursor() as cursor:
+            self._set_lease(cursor, 605, lease_status="ACTIVE")
+        reactivated = post_security_deposit(605)
+
+        self.assertFalse(reactivated["posted"])
+        self.assertEqual(reactivated["reason"], "duplicate_skip")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=605).count(), 1
+        )
+
+    def test_unresolvable_pmc_null_parent_property_posts_nothing(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=606,
+                unit_id=76,
+                property_id=86,
+                pmc_id=1,
+                lease_status="ACTIVE",
+                security_deposit=1000,
+                null_parent_property_id=True,
+            )
+
+        result = post_security_deposit(606)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "unresolvable_pmc")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=606).count(), 0
+        )
+
+    def test_unresolvable_pmc_no_matching_finance_profile_posts_nothing(self):
+        # No FinancePMCProfile created at all -- chain resolves fully but
+        # the final FinancePMCProfile lookup comes up empty.
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=607,
+                unit_id=77,
+                property_id=87,
+                pmc_id=999,
+                lease_status="ACTIVE",
+                security_deposit=1000,
+            )
+
+        result = post_security_deposit(607)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "unresolvable_pmc")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=607).count(), 0
+        )
+
+    def test_lease_not_found_posts_nothing(self):
+        result = post_security_deposit(999999)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "lease_not_found")
+
+    def test_unconfigured_chart_of_accounts_posts_nothing(self):
+        profile = self._make_profile(pmc_id=1)
+        Account.objects.filter(finance_pmc_profile=profile).delete()
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                lease_id=608,
+                unit_id=78,
+                property_id=88,
+                pmc_id=1,
+                lease_status="ACTIVE",
+                security_deposit=1000,
+            )
+
+        result = post_security_deposit(608)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "chart_of_accounts_not_configured")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=608).count(), 0
+        )
+
+
+@override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token")
+class SyncLeaseEndpointTests(TestCase):
+    """Story 2.6 tests: the internal /internal/leases/{id}/sync endpoint,
+    an HTTP-level integration test mirroring
+    SyncLeaseTransactionRentPostingIntegrationTests' pattern -- exercises
+    the view's conditional wiring (path/body id validation, token guard,
+    calling post_security_deposit), not just the posting function directly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_lease (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS lease_lease")
+            cursor.execute("DROP TABLE IF EXISTS property_unit")
+            cursor.execute("DROP TABLE IF EXISTS property_property")
+        super().tearDownClass()
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            for table in ("lease_lease", "property_unit", "property_property"):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _url(self, lease_id):
+        return reverse("sync-lease", kwargs={"lease_id": lease_id})
+
+    def test_happy_path_via_http_posts_journal_entry(self):
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=1,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO lease_lease "
+                "(id, unit_id, lease_status, security_deposit) "
+                "VALUES (%s, %s, %s, %s)",
+                [700, 60, "ACTIVE", 7500],
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [60, 70],
+            )
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [70, 1],
+            )
+
+        response = self.client.post(
+            self._url(700),
+            data={"lease_id": 700},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["content"]["posting"]["security_deposit"],
+            {"posted": True, "reason": ""},
+        )
+
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=700,
+            source_status_transition="ACTIVATE",
+        )
+        self.assertEqual(entry.finance_pmc_profile_id, profile.id)
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 2)
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 7500)
+
+    def test_missing_token_rejected_with_401(self):
+        response = self.client.post(
+            self._url(700),
+            data={"lease_id": 700},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_wrong_token_rejected_with_403(self):
+        response = self.client.post(
+            self._url(700),
+            data={"lease_id": 700},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="wrong-token",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_path_body_id_mismatch_rejected_with_400(self):
+        response = self.client.post(
+            self._url(700),
+            data={"lease_id": 701},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["content"]["path_lease_id"], 700)
+        self.assertEqual(body["content"]["body_lease_id"], 701)
+
+    def test_no_trailing_slash_url_also_works(self):
+        response = self.client.post(
+            reverse("sync-lease-no-slash", kwargs={"lease_id": 700}),
+            data={"lease_id": 700},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"]["lease_id"], 700)
+
+    def test_lease_not_found_returns_200_ack_with_no_posting(self):
+        """No row exists at this lease_id -- lease resolves to None and no
+        posting is attempted, mirroring sync_lease_transaction's bare-
+        acknowledgment behavior for an unresolvable id."""
+        response = self.client.post(
+            self._url(999999),
+            data={"lease_id": 999999},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"], {"lease_id": 999999})
