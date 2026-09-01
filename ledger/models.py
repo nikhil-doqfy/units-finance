@@ -186,6 +186,13 @@ class LeaseTransactionRef(models.Model):
     established unmanaged-model pattern (Story 1.2): `managed = False`, real
     `db_table`, minimal field list — only what a future posting story (2.2b)
     actually needs, not a full schema mirror.
+
+    Story 2.5 adds `created` and `charge_id`: `created` (the transaction's
+    own creation timestamp) drives the nearest-neighbor bounce-fee pairing
+    query, and `charge_id` (the FK to units-backend's `Charge`, populated
+    only when `cheque_type == OTHER_CHARGE`) is how Finance detects an
+    `OTHER_CHARGE` transaction actually carries a fee to post against (spec
+    Code Map).
     """
 
     lease_id = models.BigIntegerField(
@@ -195,6 +202,19 @@ class LeaseTransactionRef(models.Model):
     cheque_type = models.CharField(max_length=20)
     payment_type = models.CharField(max_length=20)
     status = models.CharField(max_length=20)
+    created = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="units-backend LeaseTransaction.created — drives Story 2.5's "
+        "nearest-neighbor OTHER_CHARGE/bounce pairing query.",
+    )
+    charge_id = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="units-backend Charge.id (LeaseTransaction.charge FK) — set "
+        "only when cheque_type == OTHER_CHARGE; not a cross-DB FK (AD-19 "
+        "precedent).",
+    )
 
     class Meta:
         managed = False
@@ -202,6 +222,27 @@ class LeaseTransactionRef(models.Model):
 
     def __str__(self):
         return f"LeaseTransactionRef(id={self.id}, lease_id={self.lease_id}, status={self.status})"
+
+
+class ChargeRef(models.Model):
+    """Read-only reference onto units-backend's Charge table (Story 2.5).
+
+    Lets Finance read a bounce fee's `amount`/`vat_amount` without importing
+    units-backend's `charges` app or code, following the same
+    unmanaged-model pattern as the other `*Ref` models above (Story 1.2's
+    precedent). Field list is kept minimal — only what `post_bounce_fee`
+    actually needs (spec Code Map).
+    """
+
+    amount = models.FloatField()
+    vat_amount = models.FloatField(default=0)
+
+    class Meta:
+        managed = False
+        db_table = "charges_charge"
+
+    def __str__(self):
+        return f"ChargeRef(id={self.id}, amount={self.amount}, vat_amount={self.vat_amount})"
 
 
 class LeaseRef(models.Model):

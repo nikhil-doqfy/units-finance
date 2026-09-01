@@ -52,6 +52,43 @@ among them, this fails loudly -- there's nothing to reverse.
 Also NOT gated on `cheque_type` (same Story 2.3 precedent, spec Boundaries
 & Constraints): the sole gate is status == BOUNCED plus the existing
 prior-posting/idempotency checks.
+
+Story 2.5: Bounce fee posting.
+
+`post_bounce_fee` posts a Journal Entry (debit AR — Tenants, credit Bank
+Charges/Fees, optional VAT Payable line) when an `OTHER_CHARGE`-type
+`LeaseTransaction` is paired with an unresolved bounced transaction on the
+same lease. Unlike every prior posting function in this module, the trigger
+is NOT a status transition on the `LeaseTransaction` passed in — `Charge`
+rows have no status transition of their own, and an `OTHER_CHARGE`
+transaction's own `status` (BALANCE, etc.) is irrelevant to whether its fee
+has been posted (spec Design Notes). Instead:
+
+  - The gate is `txn.cheque_type == OTHER_CHARGE` and `txn.charge_id` is not
+    null (spec Boundaries & Constraints; Code Map).
+  - The pairing is a nearest-neighbor heuristic, not a structural link: among
+    `BOUNCED` transactions on the same lease that already have a bounce
+    reversal posted (Story 2.4's `BOUNCED`-suffixed JournalEntry) but no
+    bounce-fee posting yet (no existing JournalEntry pairing them with any
+    `OTHER_CHARGE` transaction), pick the nearest one created before this
+    `OTHER_CHARGE` transaction (i.e. the most recent qualifying bounce,
+    since a later bounce is the one this newly-created fee charge is most
+    likely to be for) that has not itself already been paired with a
+    *different* `OTHER_CHARGE` transaction.
+  - "Consumed once matched" (Design Notes) is enforced entirely by
+    idempotency-key lookups against existing `JournalEntry` rows -- there is
+    no persisted "matched" flag on any units-backend row, and none is added
+    (spec Never).
+  - Idempotency key is `(other_charge_transaction_id, bounced_transaction_id)`
+    -- NOT `(lease_transaction_id, from_status, to_status)` (spec Boundaries
+    & Constraints, Design Notes) -- stored via `source_lease_transaction_id`
+    (the `OTHER_CHARGE` transaction's id) and a `source_status_transition`
+    string encoding the paired bounced transaction's id
+    (`BOUNCE_FEE-FOR-<bounced_transaction_id>`), so the exact-tuple lookup
+    reuses the same `JournalEntry` columns every other posting function
+    uses, without repurposing them as an actual status pair.
+  - If no unmatched candidate bounce exists, this is a genuine no-op (post
+    nothing, wait) -- not a failure (spec Boundaries & Constraints).
 """
 import logging
 
@@ -59,6 +96,7 @@ from django.db import transaction
 
 from ledger.models import (
     Account,
+    ChargeRef,
     FinancePMCProfile,
     JournalEntry,
     LeaseRef,
@@ -81,6 +119,8 @@ AR_TENANTS_ACCOUNT_NAME = "AR — Tenants"
 RENT_INCOME_ACCOUNT_NAME = "Rent Income"
 BANK_ACCOUNT_NAME = "Bank"
 BOUNCED_CHEQUES_ACCOUNT_NAME = "Bounced Cheques"
+BANK_CHARGES_FEE_INCOME_ACCOUNT_NAME = "Bank Charges/Fees"
+VAT_PAYABLE_ACCOUNT_NAME = "VAT Payable"
 
 # Trigger statuses for Story 2.3's cheque clearing posting -- a cheque is
 # "cleared" once it reaches either of these (per the existing units-backend
@@ -91,6 +131,30 @@ CLEARING_TRIGGER_STATUSES = (CHEQUE_STATUS_CREDITED, CHEQUE_STATUS_REALIZED)
 
 # Trigger status for Story 2.4's bounce reversal posting.
 CHEQUE_STATUS_BOUNCED = "BOUNCED"
+
+# Story 2.5's trigger cheque_type -- an ad-hoc fee charge, populated via
+# units-backend's generic "Other Charge" flow (spec Intent).
+OTHER_CHARGE = "OTHER_CHARGE"
+
+# Prefix identifying a Story 2.4 bounce-reversal JournalEntry among a
+# lease_transaction_id's history -- its source_status_transition is always
+# "<something>-BOUNCED" (Design Notes: post_bounce_reversal infers the
+# "from" side, but always ends in BOUNCED).
+BOUNCE_TRANSITION_SUFFIX = "-BOUNCED"
+
+# Story 2.5's idempotency-key encoding (Design Notes): the pairing has no
+# status transition of its own, so source_status_transition instead encodes
+# which bounced_transaction_id this OTHER_CHARGE transaction (the row
+# JournalEntry.source_lease_transaction_id already points at) was paired
+# with. The exact-tuple lookup this module's other posting functions already
+# do on (source_lease_transaction_id, source_status_transition) becomes,
+# for this story, exactly the spec's
+# (other_charge_transaction_id, bounced_transaction_id) idempotency key.
+BOUNCE_FEE_TRANSITION_PREFIX = "BOUNCE_FEE-FOR-"
+
+
+def _bounce_fee_transition(bounced_transaction_id):
+    return f"{BOUNCE_FEE_TRANSITION_PREFIX}{bounced_transaction_id}"
 
 # Prefix identifying the original Rent AR posting's source_status_transition
 # among a lease_transaction_id's JournalEntry history (Design Notes; AD-16) --
@@ -678,5 +742,305 @@ def post_bounce_reversal(lease_transaction_id, txn=None):
         amount,
         transition,
         original_entry.id,
+    )
+    return {"posted": True, "reason": ""}
+
+
+def post_bounce_fee(lease_transaction_id, txn=None):
+    """Post a Journal Entry for a bounce fee paired to an unresolved bounce.
+
+    `txn` may be passed in by a caller that has already fetched the
+    `LeaseTransactionRef` (mirrors the `txn` param on every other posting
+    function in this module) -- avoids a second, redundant query for the
+    same row. If omitted, this function fetches it itself.
+
+    Returns a dict: {"posted": bool, "reason": str} -- same shape/contract as
+    every other posting function here. Never raises for an expected failure
+    path; only a genuinely unexpected DB error propagates out of the atomic
+    block.
+
+    Trigger: `txn.cheque_type == OTHER_CHARGE` and `txn.charge_id` is not
+    null (spec Boundaries & Constraints). Neither `txn.status` nor any
+    status transition gates this function -- a Charge/OTHER_CHARGE pairing
+    has no status transition of its own (Design Notes).
+    """
+    if txn is None:
+        txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
+    if txn is None:
+        logger.error(
+            "post_bounce_fee: no LeaseTransaction found for id=%s -- cannot "
+            "post",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "lease_transaction_not_found"}
+
+    if txn.cheque_type != OTHER_CHARGE or not txn.charge_id:
+        # Not this story's trigger -- correctly a no-op, not a failure.
+        return {"posted": False, "reason": "not_other_charge_type"}
+
+    if txn.created is None:
+        # The nearest-neighbor pairing query is created-timestamp-ordered;
+        # without one there is no principled way to pick a candidate bounce.
+        logger.error(
+            "post_bounce_fee: OTHER_CHARGE LeaseTransaction id=%s has no "
+            "created timestamp -- cannot run the pairing query",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "missing_created_timestamp"}
+
+    # Candidate bounced transactions: every JournalEntry on this same lease
+    # whose transition is a Story 2.4 bounce reversal (ends "-BOUNCED"),
+    # i.e. one BOUNCED lease_transaction_id per such entry. Scoped to the
+    # same lease via LeaseTransactionRef.lease_id (spec Boundaries &
+    # Constraints: "on the same Lease").
+    bounced_ids_on_lease = list(
+        LeaseTransactionRef.objects.filter(
+            lease_id=txn.lease_id, status=CHEQUE_STATUS_BOUNCED
+        ).values_list("id", flat=True)
+    )
+    if not bounced_ids_on_lease:
+        # Steady state: no bounce exists yet on this lease at all -- post
+        # nothing and wait (spec Boundaries & Constraints), not a failure.
+        return {"posted": False, "reason": "no_unresolved_bounce"}
+
+    bounce_reversal_entries = (
+        JournalEntry.objects.filter(
+            source_lease_transaction_id__in=bounced_ids_on_lease,
+            source_status_transition__endswith=BOUNCE_TRANSITION_SUFFIX,
+        )
+        .exclude(source_status_transition__startswith=BOUNCE_FEE_TRANSITION_PREFIX)
+        .order_by("posted_at", "id")
+    )
+
+    # "Consumed once matched" (Design Notes): a bounced_transaction_id
+    # already paired with a DIFFERENT OTHER_CHARGE transaction (a
+    # BOUNCE_FEE-FOR-<id> JournalEntry whose own source_lease_transaction_id
+    # is not this OTHER_CHARGE transaction's id) is excluded from candidate
+    # matching -- checked via existing JournalEntry history, no persisted
+    # "matched" flag anywhere. A pairing already recorded against THIS SAME
+    # OTHER_CHARGE transaction is deliberately NOT excluded here -- that
+    # case is a duplicate re-sync, not a re-pairing, and must fall through
+    # to the idempotency check below instead (spec: "never re-pair ... to a
+    # different bounce" -- re-finding the same pairing for the same
+    # transaction is not a re-pair).
+    already_paired_bounce_ids = set(
+        JournalEntry.objects.filter(
+            source_status_transition__startswith=BOUNCE_FEE_TRANSITION_PREFIX,
+            source_status_transition__in=[
+                _bounce_fee_transition(bid) for bid in bounced_ids_on_lease
+            ],
+        )
+        .exclude(source_lease_transaction_id=lease_transaction_id)
+        .values_list("source_status_transition", flat=True)
+    )
+    already_paired_bounce_ids = {
+        s[len(BOUNCE_FEE_TRANSITION_PREFIX) :] for s in already_paired_bounce_ids
+    }
+
+    # Nearest-neighbor pick: the OLDEST unresolved bounce created before this
+    # OTHER_CHARGE transaction, still unmatched (spec Boundaries &
+    # Constraints; Design Notes -- confirmed by the "two simultaneous
+    # bounces" I/O matrix row: the fee pairs with the OLDER unresolved
+    # bounce). `bounce_reversal_entries` is already ordered oldest-first.
+    bounced_transaction_id = None
+    for entry in bounce_reversal_entries:
+        candidate_id = entry.source_lease_transaction_id
+        if str(candidate_id) in already_paired_bounce_ids:
+            continue
+        candidate_txn = LeaseTransactionRef.objects.filter(pk=candidate_id).first()
+        if candidate_txn is None:
+            continue
+        if candidate_txn.created is None or candidate_txn.created >= txn.created:
+            # The bounce must have happened before this OTHER_CHARGE
+            # transaction was created (spec Boundaries & Constraints: "oldest
+            # OTHER_CHARGE transaction created after the bounce event") --
+            # symmetrically, from this OTHER_CHARGE transaction's own point
+            # of view, only a bounce created before it is eligible. A null
+            # `created` on the candidate means we cannot verify the ordering,
+            # so it must be excluded rather than accepted by default.
+            continue
+        bounced_transaction_id = candidate_id
+        break
+
+    if bounced_transaction_id is None:
+        # Genuine steady state (spec Boundaries & Constraints; I/O matrix
+        # "No fee charge yet" row's mirror image): no unmatched bounce
+        # exists yet for this fee charge to pair with. Post nothing and
+        # wait -- not a failure.
+        return {"posted": False, "reason": "no_unresolved_bounce"}
+
+    transition = _bounce_fee_transition(bounced_transaction_id)
+
+    # Idempotency key: (other_charge_transaction_id, bounced_transaction_id)
+    # -- encoded as (source_lease_transaction_id, source_status_transition),
+    # NOT (lease_transaction_id, from_status, to_status) (spec Boundaries &
+    # Constraints, Design Notes).
+    if JournalEntry.objects.filter(
+        source_lease_transaction_id=lease_transaction_id,
+        source_status_transition=transition,
+    ).exists():
+        logger.info(
+            "post_bounce_fee: JournalEntry already exists for "
+            "other_charge_transaction_id=%s bounced_transaction_id=%s -- "
+            "skipping duplicate post",
+            lease_transaction_id,
+            bounced_transaction_id,
+        )
+        return {"posted": False, "reason": "duplicate_skip"}
+
+    charge = ChargeRef.objects.filter(pk=txn.charge_id).first()
+    if charge is None:
+        logger.error(
+            "post_bounce_fee: no Charge found for charge_id=%s "
+            "(other_charge_transaction_id=%s) -- cannot post",
+            txn.charge_id,
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "charge_not_found"}
+
+    # Walk the same PMC resolution chain every other posting function uses --
+    # resolved via the OTHER_CHARGE transaction's own lease_id (spec
+    # Boundaries & Constraints: "same chain, different starting transaction").
+    lease = LeaseRef.objects.filter(pk=txn.lease_id).first()
+    if lease is None:
+        logger.error(
+            "post_bounce_fee: unresolvable PMC for "
+            "other_charge_transaction_id=%s -- no Lease found for "
+            "lease_id=%s",
+            lease_transaction_id,
+            txn.lease_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    unit = UnitRef.objects.filter(pk=lease.unit_id).first()
+    if unit is None:
+        logger.error(
+            "post_bounce_fee: unresolvable PMC for "
+            "other_charge_transaction_id=%s -- no Unit found for unit_id=%s",
+            lease_transaction_id,
+            lease.unit_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    property_ = PropertyRef.objects.filter(pk=unit.parent_property_id).first()
+    if property_ is None:
+        logger.error(
+            "post_bounce_fee: unresolvable PMC for "
+            "other_charge_transaction_id=%s -- no Property found for "
+            "parent_property_id=%s",
+            lease_transaction_id,
+            unit.parent_property_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    profile = FinancePMCProfile.objects.filter(pmc_id=property_.pmc_id).first()
+    if profile is None:
+        logger.error(
+            "post_bounce_fee: unresolvable PMC for "
+            "other_charge_transaction_id=%s -- no FinancePMCProfile found "
+            "for pmc_id=%s",
+            lease_transaction_id,
+            property_.pmc_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    fee_amount = charge.amount
+    if fee_amount is None:
+        logger.error(
+            "post_bounce_fee: Charge charge_id=%s has no amount "
+            "(other_charge_transaction_id=%s) -- cannot post",
+            txn.charge_id,
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "missing_charge_amount"}
+    vat_amount = charge.vat_amount or 0
+
+    try:
+        ar_account = Account.objects.get(
+            finance_pmc_profile=profile, name=AR_TENANTS_ACCOUNT_NAME
+        )
+        fee_income_account = Account.objects.get(
+            finance_pmc_profile=profile, name=BANK_CHARGES_FEE_INCOME_ACCOUNT_NAME
+        )
+        vat_payable_account = None
+        if vat_amount:
+            vat_payable_account = Account.objects.get(
+                finance_pmc_profile=profile, name=VAT_PAYABLE_ACCOUNT_NAME
+            )
+    except Account.DoesNotExist:
+        logger.error(
+            "post_bounce_fee: Chart of Accounts not configured for "
+            "FinancePMCProfile pmc_id=%s (other_charge_transaction_id=%s) "
+            "-- expected Accounts named %r, %r%s",
+            profile.pmc_id,
+            lease_transaction_id,
+            AR_TENANTS_ACCOUNT_NAME,
+            BANK_CHARGES_FEE_INCOME_ACCOUNT_NAME,
+            f" and {VAT_PAYABLE_ACCOUNT_NAME!r}" if vat_amount else "",
+        )
+        return {"posted": False, "reason": "chart_of_accounts_not_configured"}
+
+    # AR debit == (Bank Charges/Fee Income credit + VAT Payable credit), per
+    # the spec's explicit balance framing -- AR carries the tenant's full
+    # amount owed (fee + VAT), Fee Income carries only the fee itself, and
+    # VAT Payable carries only the VAT (spec Boundaries & Constraints).
+    ar_debit_total = fee_amount + vat_amount
+
+    with transaction.atomic():
+        entry = JournalEntry.objects.create(
+            finance_pmc_profile=profile,
+            source_lease_transaction_id=lease_transaction_id,
+            source_status_transition=transition,
+        )
+
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=ar_account,
+            debit=ar_debit_total,
+            credit=0,
+        )
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=fee_income_account,
+            debit=0,
+            credit=fee_amount,
+        )
+        if vat_amount:
+            LedgerLine.objects.create(
+                journal_entry=entry,
+                account=vat_payable_account,
+                debit=0,
+                credit=vat_amount,
+            )
+
+        debit_total = sum(line.debit for line in entry.lines.all())
+        credit_total = sum(line.credit for line in entry.lines.all())
+        if debit_total != credit_total or debit_total != ar_debit_total:
+            # Same explicit if/raise balance check as every other posting
+            # function here -- never `assert` (NFR-1). Raising here rolls
+            # back the whole atomic block.
+            raise ValueError(
+                f"post_bounce_fee: unbalanced entry for "
+                f"other_charge_transaction_id={lease_transaction_id} "
+                f"(debit={debit_total}, credit={credit_total}, "
+                f"fee_amount={fee_amount}, vat_amount={vat_amount})"
+            )
+
+    # Heuristic-match logging (spec Boundaries & Constraints): every
+    # successful post logs at INFO or above, naming both transaction ids, so
+    # a suspected mismatch is traceable and manually correctable -- this is
+    # not a silent best-effort guess.
+    logger.info(
+        "post_bounce_fee: posted JournalEntry id=%s pairing "
+        "other_charge_transaction_id=%s with bounced_transaction_id=%s via "
+        "nearest-neighbor heuristic match (pmc_id=%s, fee_amount=%s, "
+        "vat_amount=%s) -- HEURISTIC MATCH, verify/reconcile manually if a "
+        "mismatch is suspected",
+        entry.id,
+        lease_transaction_id,
+        bounced_transaction_id,
+        profile.pmc_id,
+        fee_amount,
+        vat_amount,
     )
     return {"posted": True, "reason": ""}

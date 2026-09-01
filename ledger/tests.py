@@ -23,7 +23,12 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from ledger.models import Account, FinancePMCProfile, JournalEntry, LedgerLine
-from ledger.posting import post_bounce_reversal, post_cheque_clearing, post_rent_ar
+from ledger.posting import (
+    post_bounce_fee,
+    post_bounce_reversal,
+    post_cheque_clearing,
+    post_rent_ar,
+)
 from ledger.seed import STANDARD_CHART_OF_ACCOUNTS
 
 
@@ -306,7 +311,9 @@ class SyncLeaseTransactionEndpointTests(TestCase):
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
                     payment_type VARCHAR(20) NOT NULL,
-                    status VARCHAR(20) NOT NULL
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT
                 )
                 """
             )
@@ -499,7 +506,9 @@ class PostRentArTests(TestCase):
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
                     payment_type VARCHAR(20) NOT NULL,
-                    status VARCHAR(20) NOT NULL
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT
                 )
                 """
             )
@@ -808,7 +817,9 @@ class PostChequeClearingTests(TestCase):
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
                     payment_type VARCHAR(20) NOT NULL,
-                    status VARCHAR(20) NOT NULL
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT
                 )
                 """
             )
@@ -1168,7 +1179,9 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
                     payment_type VARCHAR(20) NOT NULL,
-                    status VARCHAR(20) NOT NULL
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT
                 )
                 """
             )
@@ -1306,7 +1319,9 @@ class PostBounceReversalTests(TestCase):
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
                     payment_type VARCHAR(20) NOT NULL,
-                    status VARCHAR(20) NOT NULL
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT
                 )
                 """
             )
@@ -1768,4 +1783,639 @@ class PostBounceReversalTests(TestCase):
                 source_status_transition="BALANCE-BOUNCED",
             ).count(),
             0,
+        )
+
+
+class PostBounceFeeTests(TestCase):
+    """Story 2.5 tests: post_bounce_fee posting logic.
+
+    Extends the established hand-rolled-stand-in-table technique
+    (LeaseTransactionRef/LeaseRef/UnitRef/PropertyRef) with a new stand-in
+    `charges_charge` table (ChargeRef), and adds `created`/`charge_id`
+    columns to the existing `lease_leasetransaction` stand-in table.
+
+    Covers all five I/O matrix rows from the spec:
+      1. Simple bounce fee, no VAT -- 2-line balanced entry.
+      2. Bounce fee with VAT -- 3-line balanced entry.
+      3. No fee charge yet -- no posting, not a failure.
+      4. Duplicate sync -- second call is a no-op, exactly one JournalEntry.
+      5. Two simultaneous bounces, one fee charge -- pairs with the OLDER
+         unresolved bounce; the newer bounce still waits.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_leasetransaction (
+                    id BIGSERIAL PRIMARY KEY,
+                    lease_id BIGINT NOT NULL,
+                    amount DOUBLE PRECISION,
+                    cheque_type VARCHAR(20) NOT NULL,
+                    payment_type VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_lease (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS charges_charge (
+                    id BIGSERIAL PRIMARY KEY,
+                    amount DOUBLE PRECISION,
+                    vat_amount DOUBLE PRECISION NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS lease_leasetransaction")
+            cursor.execute("DROP TABLE IF EXISTS lease_lease")
+            cursor.execute("DROP TABLE IF EXISTS property_unit")
+            cursor.execute("DROP TABLE IF EXISTS property_property")
+            cursor.execute("DROP TABLE IF EXISTS charges_charge")
+        super().tearDownClass()
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            for table in (
+                "lease_leasetransaction",
+                "lease_lease",
+                "property_unit",
+                "property_property",
+                "charges_charge",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _insert_pmc_chain(self, cursor, lease_id, unit_id, property_id, pmc_id):
+        cursor.execute(
+            "INSERT INTO lease_lease (id, unit_id) VALUES (%s, %s)",
+            [lease_id, unit_id],
+        )
+        cursor.execute(
+            "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+            [unit_id, property_id],
+        )
+        cursor.execute(
+            "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+            [property_id, pmc_id],
+        )
+
+    def _insert_txn(
+        self,
+        cursor,
+        txn_id,
+        lease_id,
+        amount,
+        cheque_type,
+        status,
+        created,
+        charge_id=None,
+    ):
+        cursor.execute(
+            """
+            INSERT INTO lease_leasetransaction
+                (id, lease_id, amount, cheque_type, payment_type, status,
+                 created, charge_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            [
+                txn_id,
+                lease_id,
+                amount,
+                cheque_type,
+                "CHEQUE",
+                status,
+                created,
+                charge_id,
+            ],
+        )
+
+    def _insert_charge(self, cursor, charge_id, amount, vat_amount=0):
+        cursor.execute(
+            "INSERT INTO charges_charge (id, amount, vat_amount) VALUES (%s, %s, %s)",
+            [charge_id, amount, vat_amount],
+        )
+
+    def _make_profile(self, pmc_id=1):
+        return FinancePMCProfile.objects.create(
+            pmc_id=pmc_id,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+    def _bounce(
+        self,
+        cursor,
+        txn_id,
+        lease_id,
+        unit_id,
+        property_id,
+        pmc_id,
+        amount,
+        created,
+    ):
+        """Set up a fully-resolved, already-reversed bounced transaction:
+        inserts the PMC chain + the BOUNCED LeaseTransaction row, posts the
+        rent AR (CREATE-BALANCE) and bounce reversal (BALANCE-BOUNCED)
+        JournalEntries via the real posting functions, mirroring
+        PostBounceReversalTests' setup exactly."""
+        self._insert_pmc_chain(cursor, lease_id, unit_id, property_id, pmc_id)
+        self._insert_txn(
+            cursor, txn_id, lease_id, amount, "RENT_CHEQUE", "BALANCE", created
+        )
+        self.assertTrue(post_rent_ar(txn_id)["posted"])
+        cursor.execute(
+            "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = %s",
+            [txn_id],
+        )
+        self.assertTrue(post_bounce_reversal(txn_id)["posted"])
+
+    def test_simple_bounce_fee_no_vat_posts_balanced_two_line_entry(self):
+        from datetime import datetime, timedelta, timezone as dt_timezone
+
+        profile = self._make_profile(pmc_id=1)
+        bounce_time = datetime(2026, 1, 1, tzinfo=dt_timezone.utc)
+        charge_time = bounce_time + timedelta(days=1)
+
+        with connection.cursor() as cursor:
+            self._bounce(
+                cursor,
+                txn_id=400,
+                lease_id=40,
+                unit_id=40,
+                property_id=40,
+                pmc_id=1,
+                amount=5000,
+                created=bounce_time,
+            )
+            self._insert_charge(cursor, charge_id=900, amount=150, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=401,
+                lease_id=40,
+                amount=150,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                created=charge_time,
+                charge_id=900,
+            )
+
+        result = post_bounce_fee(401)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=401,
+            source_status_transition="BOUNCE_FEE-FOR-400",
+        )
+        self.assertEqual(entry.finance_pmc_profile_id, profile.id)
+
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 2)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        fee_line = lines.get(account__name="Bank Charges/Fees")
+        self.assertEqual(ar_line.debit, 150)
+        self.assertEqual(ar_line.credit, 0)
+        self.assertEqual(fee_line.debit, 0)
+        self.assertEqual(fee_line.credit, 150)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 150)
+
+    def test_bounce_fee_with_vat_posts_balanced_three_line_entry(self):
+        from datetime import datetime, timedelta, timezone as dt_timezone
+
+        profile = self._make_profile(pmc_id=1)
+        bounce_time = datetime(2026, 1, 1, tzinfo=dt_timezone.utc)
+        charge_time = bounce_time + timedelta(days=1)
+
+        with connection.cursor() as cursor:
+            self._bounce(
+                cursor,
+                txn_id=410,
+                lease_id=41,
+                unit_id=41,
+                property_id=41,
+                pmc_id=1,
+                amount=5000,
+                created=bounce_time,
+            )
+            self._insert_charge(cursor, charge_id=910, amount=100, vat_amount=5)
+            self._insert_txn(
+                cursor,
+                txn_id=411,
+                lease_id=41,
+                amount=100,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                created=charge_time,
+                charge_id=910,
+            )
+
+        result = post_bounce_fee(411)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=411,
+            source_status_transition="BOUNCE_FEE-FOR-410",
+        )
+
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 3)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        fee_line = lines.get(account__name="Bank Charges/Fees")
+        vat_line = lines.get(account__name="VAT Payable")
+
+        self.assertEqual(ar_line.debit, 105)
+        self.assertEqual(ar_line.credit, 0)
+        self.assertEqual(fee_line.debit, 0)
+        self.assertEqual(fee_line.credit, 100)
+        self.assertEqual(vat_line.debit, 0)
+        self.assertEqual(vat_line.credit, 5)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 105)
+
+    def test_no_fee_charge_yet_posts_nothing_not_a_failure(self):
+        """I/O matrix row 3: a bounced transaction exists (already reversed
+        per Story 2.4), but no OTHER_CHARGE transaction exists on the lease
+        at all yet. `sync_lease_transaction` runs post_bounce_fee on every
+        sync regardless of cheque_type (view-level, not gated) -- so this
+        exercises the real steady-state call: syncing the bounced
+        transaction itself, which correctly no-ops via the cheque_type gate,
+        without ever creating a bounce-fee JournalEntry."""
+        from datetime import datetime, timezone as dt_timezone
+
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._bounce(
+                cursor,
+                txn_id=420,
+                lease_id=42,
+                unit_id=42,
+                property_id=42,
+                pmc_id=1,
+                amount=5000,
+                created=datetime(2026, 1, 1, tzinfo=dt_timezone.utc),
+            )
+
+        result = post_bounce_fee(420)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "not_other_charge_type")
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                source_status_transition__startswith="BOUNCE_FEE-FOR-"
+            ).exists()
+        )
+
+    def test_other_charge_with_no_matching_bounce_posts_nothing_and_waits(self):
+        """The genuine steady-state no-op: an OTHER_CHARGE transaction
+        exists, but no unresolved bounce exists yet on its lease for it to
+        pair with."""
+        from datetime import datetime, timezone as dt_timezone
+
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(cursor, lease_id=43, unit_id=43, property_id=43, pmc_id=1)
+            self._insert_charge(cursor, charge_id=930, amount=150, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=430,
+                lease_id=43,
+                amount=150,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                created=datetime(2026, 1, 1, tzinfo=dt_timezone.utc),
+                charge_id=930,
+            )
+
+        result = post_bounce_fee(430)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_unresolved_bounce")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=430).count(), 0
+        )
+
+    def test_duplicate_sync_is_skipped(self):
+        from datetime import datetime, timedelta, timezone as dt_timezone
+
+        self._make_profile(pmc_id=1)
+        bounce_time = datetime(2026, 1, 1, tzinfo=dt_timezone.utc)
+        charge_time = bounce_time + timedelta(days=1)
+
+        with connection.cursor() as cursor:
+            self._bounce(
+                cursor,
+                txn_id=440,
+                lease_id=44,
+                unit_id=44,
+                property_id=44,
+                pmc_id=1,
+                amount=5000,
+                created=bounce_time,
+            )
+            self._insert_charge(cursor, charge_id=940, amount=150, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=441,
+                lease_id=44,
+                amount=150,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                created=charge_time,
+                charge_id=940,
+            )
+
+        first = post_bounce_fee(441)
+        second = post_bounce_fee(441)
+
+        self.assertTrue(first["posted"])
+        self.assertFalse(second["posted"])
+        self.assertEqual(second["reason"], "duplicate_skip")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=441,
+                source_status_transition="BOUNCE_FEE-FOR-440",
+            ).count(),
+            1,
+        )
+
+    def test_two_simultaneous_bounces_one_fee_pairs_with_older_bounce(self):
+        """I/O matrix row 5: two unresolved bounced transactions on the same
+        lease, one OTHER_CHARGE transaction -- the fee pairs with the OLDER
+        unresolved bounce (nearest-neighbor); the newer bounce still waits
+        for its own fee charge."""
+        from datetime import datetime, timedelta, timezone as dt_timezone
+
+        self._make_profile(pmc_id=1)
+        older_bounce_time = datetime(2026, 1, 1, tzinfo=dt_timezone.utc)
+        newer_bounce_time = older_bounce_time + timedelta(days=1)
+        charge_time = newer_bounce_time + timedelta(days=1)
+
+        with connection.cursor() as cursor:
+            # Older bounce, on the same lease.
+            self._insert_pmc_chain(cursor, lease_id=45, unit_id=45, property_id=45, pmc_id=1)
+            self._insert_txn(
+                cursor, 450, 45, 2000, "RENT_CHEQUE", "BALANCE", older_bounce_time
+            )
+            self.assertTrue(post_rent_ar(450)["posted"])
+            cursor.execute(
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 450"
+            )
+            self.assertTrue(post_bounce_reversal(450)["posted"])
+
+            # Newer bounce, same lease.
+            self._insert_txn(
+                cursor, 451, 45, 6000, "RENT_CHEQUE", "BALANCE", newer_bounce_time
+            )
+            self.assertTrue(post_rent_ar(451)["posted"])
+            cursor.execute(
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 451"
+            )
+            self.assertTrue(post_bounce_reversal(451)["posted"])
+
+            # One fee charge, created after both bounces.
+            self._insert_charge(cursor, charge_id=950, amount=150, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                452,
+                45,
+                150,
+                "OTHER_CHARGE",
+                "BALANCE",
+                charge_time,
+                charge_id=950,
+            )
+
+        result = post_bounce_fee(452)
+
+        self.assertTrue(result["posted"])
+        # Pairs with the OLDER unresolved bounce (450), not the newer (451).
+        self.assertTrue(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=452,
+                source_status_transition="BOUNCE_FEE-FOR-450",
+            ).exists()
+        )
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=452,
+                source_status_transition="BOUNCE_FEE-FOR-451",
+            ).exists()
+        )
+
+        # The newer bounce (451) still has no bounce-fee posting -- it waits
+        # for its own fee charge.
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                source_status_transition="BOUNCE_FEE-FOR-451"
+            ).exists()
+        )
+
+    def test_unresolved_pmc_posts_nothing(self):
+        """A resolvable OTHER_CHARGE/bounce pairing whose PMC chain is
+        broken (by the time bounce-fee posting runs) fails loudly (logged),
+        consistent with every other posting function's unresolvable_pmc
+        path. Mirrors PostBounceReversalTests.
+        test_unresolvable_pmc_posts_nothing's technique: post the bounce
+        reversal first while the chain is intact, then break the chain
+        (delete the Property row) before attempting the bounce-fee post --
+        isolates this from the no_prior_posting/no_unresolved_bounce path,
+        since the JournalEntry FK is to FinancePMCProfile (deleting the
+        profile itself would cascade-delete the JournalEntry too)."""
+        from datetime import datetime, timedelta, timezone as dt_timezone
+
+        bounce_time = datetime(2026, 1, 1, tzinfo=dt_timezone.utc)
+        charge_time = bounce_time + timedelta(days=1)
+
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(cursor, lease_id=46, unit_id=46, property_id=46, pmc_id=1)
+            self._insert_txn(
+                cursor, 460, 46, 5000, "RENT_CHEQUE", "BALANCE", bounce_time
+            )
+            self.assertTrue(post_rent_ar(460)["posted"])
+            cursor.execute(
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 460"
+            )
+            self.assertTrue(post_bounce_reversal(460)["posted"])
+
+            self._insert_charge(cursor, charge_id=960, amount=150, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                461,
+                46,
+                150,
+                "OTHER_CHARGE",
+                "BALANCE",
+                charge_time,
+                charge_id=960,
+            )
+
+            # Break the chain after the bounce reversal already exists:
+            # delete the Property row the Unit points at (both the bounced
+            # and OTHER_CHARGE transactions resolve through the same
+            # lease/unit/property chain, so this breaks resolution for the
+            # OTHER_CHARGE transaction too).
+            cursor.execute("DELETE FROM property_property WHERE id = %s", [46])
+
+        result = post_bounce_fee(461)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "unresolvable_pmc")
+
+    def test_candidate_with_null_created_is_excluded_not_accepted(self):
+        """Regression: a bounced transaction whose `created` timestamp is
+        null must NOT be treated as eligible by the nearest-neighbor pairing
+        loop. Two unresolved bounces on the same lease -- one with a null
+        `created`, one with a real, later `created` -- and a fee charge:
+        the fee must pair with the real-timestamped bounce, never the
+        null-timestamped one (which cannot be verified to precede the fee
+        charge)."""
+        from datetime import datetime, timedelta, timezone as dt_timezone
+
+        self._make_profile(pmc_id=1)
+        real_bounce_time = datetime(2026, 1, 1, tzinfo=dt_timezone.utc)
+        charge_time = real_bounce_time + timedelta(days=1)
+
+        with connection.cursor() as cursor:
+            # Bounce with a null `created` (e.g. a legacy/backfilled row).
+            self._insert_pmc_chain(cursor, lease_id=47, unit_id=47, property_id=47, pmc_id=1)
+            self._insert_txn(
+                cursor, 470, 47, 2000, "RENT_CHEQUE", "BALANCE", None
+            )
+            self.assertTrue(post_rent_ar(470)["posted"])
+            cursor.execute(
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 470"
+            )
+            self.assertTrue(post_bounce_reversal(470)["posted"])
+
+            # Bounce with a real, known-earlier `created`, same lease.
+            self._insert_txn(
+                cursor, 471, 47, 6000, "RENT_CHEQUE", "BALANCE", real_bounce_time
+            )
+            self.assertTrue(post_rent_ar(471)["posted"])
+            cursor.execute(
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 471"
+            )
+            self.assertTrue(post_bounce_reversal(471)["posted"])
+
+            self._insert_charge(cursor, charge_id=970, amount=150, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                472,
+                47,
+                150,
+                "OTHER_CHARGE",
+                "BALANCE",
+                charge_time,
+                charge_id=970,
+            )
+
+        result = post_bounce_fee(472)
+
+        self.assertTrue(result["posted"])
+        # Must pair with the real-timestamped bounce (471), never the
+        # null-timestamped one (470), regardless of query ordering.
+        self.assertTrue(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=472,
+                source_status_transition="BOUNCE_FEE-FOR-471",
+            ).exists()
+        )
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=472,
+                source_status_transition="BOUNCE_FEE-FOR-470",
+            ).exists()
+        )
+
+    def test_charge_with_null_amount_posts_nothing_not_a_crash(self):
+        """Regression: Charge.amount is a nullable field in units-backend.
+        A null amount must return the module's standard
+        {"posted": False, "reason": ...} contract, never raise an uncaught
+        TypeError from `fee_amount + vat_amount` arithmetic."""
+        from datetime import datetime, timedelta, timezone as dt_timezone
+
+        self._make_profile(pmc_id=1)
+        bounce_time = datetime(2026, 1, 1, tzinfo=dt_timezone.utc)
+        charge_time = bounce_time + timedelta(days=1)
+
+        with connection.cursor() as cursor:
+            self._bounce(
+                cursor,
+                txn_id=480,
+                lease_id=48,
+                unit_id=48,
+                property_id=48,
+                pmc_id=1,
+                amount=5000,
+                created=bounce_time,
+            )
+            # Charge with a null amount -- bypass _insert_charge, whose
+            # stand-in DDL declares `amount` NOT NULL, to model the real
+            # units-backend column (nullable FloatField).
+            cursor.execute(
+                "INSERT INTO charges_charge (id, amount, vat_amount) "
+                "VALUES (%s, NULL, %s)",
+                [980, 0],
+            )
+            self._insert_txn(
+                cursor,
+                481,
+                48,
+                150,
+                "OTHER_CHARGE",
+                "BALANCE",
+                charge_time,
+                charge_id=980,
+            )
+
+        result = post_bounce_fee(481)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "missing_charge_amount")
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=481,
+                source_status_transition="BOUNCE_FEE-FOR-480",
+            ).exists()
         )

@@ -9,13 +9,17 @@ LeaseTransaction (`cheque_type == RENT_CHEQUE`) triggers `post_rent_ar`.
 Story 2.3 adds `post_cheque_clearing` alongside it, and Story 2.4 adds
 `post_bounce_reversal` alongside both -- all three checks run on every sync
 call, each independently no-oping when its own trigger condition isn't met
-(deliberately not gated on cheque_type, per Spec Change Log).
+(deliberately not gated on cheque_type, per Spec Change Log). Story 2.5 adds
+`post_bounce_fee` alongside all three -- also not gated on cheque_type at
+the view level (its own `cheque_type == OTHER_CHARGE` check lives inside
+the function itself, same pattern as the others' internal gates).
 """
 from rest_framework.decorators import api_view
 
 from ledger.decorators import require_internal_token
 from ledger.posting import (
     RENT_CHEQUE,
+    post_bounce_fee,
     post_bounce_reversal,
     post_cheque_clearing,
     post_rent_ar,
@@ -72,6 +76,13 @@ def sync_lease_transaction(request, lease_transaction_id):
         # sole gate is status == BOUNCED plus post_bounce_reversal's own
         # prior-posting/idempotency checks.
         posting_results["bounce_reversal"] = post_bounce_reversal(
+            lease_transaction_id, txn=txn
+        )
+
+        # Story 2.5: runs on every sync regardless of cheque_type -- its own
+        # cheque_type == OTHER_CHARGE / charge_id-not-null gate lives inside
+        # post_bounce_fee itself (spec Boundaries & Constraints).
+        posting_results["bounce_fee"] = post_bounce_fee(
             lease_transaction_id, txn=txn
         )
 
