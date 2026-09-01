@@ -37,6 +37,47 @@ class FinancePMCProfile(models.Model):
         return f"FinancePMCProfile(pmc_id={self.pmc_id}, country={self.country})"
 
 
+class Account(models.Model):
+    """One Chart-of-Accounts line, scoped to a single `FinancePMCProfile`.
+
+    Unlike `FinancePMCProfile.pmc_id` (a plain int referencing a table in a
+    different Django project's migration set), `finance_pmc_profile` is a
+    real Django `ForeignKey` — both `Account` and `FinancePMCProfile` are
+    Finance-owned models living in this same app/database (spec Boundaries
+    & Constraints).
+
+    Rows are created exclusively by the standard Chart of Accounts seed
+    (`ledger.signals`/`ledger.seed`), triggered automatically via a
+    `post_save` signal on `FinancePMCProfile` — there is no CoA editor UI or
+    per-PMC customization in Phase 1 (FR-3 Notes).
+    """
+
+    ASSET = "Asset"
+    LIABILITY = "Liability"
+    INCOME = "Income"
+    EXPENSE = "Expense"
+    EQUITY = "Equity"
+
+    ACCOUNT_TYPE_CHOICES = [
+        (ASSET, "Asset"),
+        (LIABILITY, "Liability"),
+        (INCOME, "Income"),
+        (EXPENSE, "Expense"),
+        (EQUITY, "Equity"),
+    ]
+
+    finance_pmc_profile = models.ForeignKey(
+        FinancePMCProfile,
+        on_delete=models.CASCADE,
+        related_name="accounts",
+    )
+    name = models.CharField(max_length=255)
+    account_type = models.CharField(max_length=20, choices=ACCOUNT_TYPE_CHOICES)
+
+    def __str__(self):
+        return f"Account(name={self.name}, type={self.account_type}, pmc_profile_id={self.finance_pmc_profile_id})"
+
+
 class PropertyManagmentCompanyRef(models.Model):
     """Read-only reference onto units-backend's PropertyManagmentCompany table.
 
