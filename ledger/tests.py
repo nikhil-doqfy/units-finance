@@ -23,7 +23,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from ledger.models import Account, FinancePMCProfile, JournalEntry, LedgerLine
-from ledger.posting import post_cheque_clearing, post_rent_ar
+from ledger.posting import post_bounce_reversal, post_cheque_clearing, post_rent_ar
 from ledger.seed import STANDARD_CHART_OF_ACCOUNTS
 
 
@@ -178,8 +178,8 @@ class SeedStandardChartOfAccountsTests(TestCase):
         self.assertEqual(actual_pairs, expected_pairs)
 
         # Independent of STANDARD_CHART_OF_ACCOUNTS — asserts the literal FR-3
-        # account list so a typo/misclassification introduced in seed.py
-        # itself would fail this test, not just self-agree with it.
+        # + Story 2.4 account list so a typo/misclassification introduced in
+        # seed.py itself would fail this test, not just self-agree with it.
         self.assertEqual(
             actual_pairs,
             {
@@ -191,6 +191,7 @@ class SeedStandardChartOfAccountsTests(TestCase):
                 ("AP — PMC Commission", Account.LIABILITY),
                 ("Commission Expense", Account.EXPENSE),
                 ("Bank Charges/Fees", Account.EXPENSE),
+                ("Bounced Cheques", Account.ASSET),
             },
         )
 
@@ -1266,3 +1267,505 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
         self.assertEqual(debit_total, 7500)
+
+
+class PostBounceReversalTests(TestCase):
+    """Story 2.4 tests: post_bounce_reversal posting logic.
+
+    Extends PostRentArTests/PostChequeClearingTests' hand-rolled
+    stand-in-table technique (LeaseTransactionRef/LeaseRef/UnitRef/
+    PropertyRef) to exercise the chain-walking code path without importing
+    units-backend.
+
+    Covers all four I/O matrix rows from the spec:
+      1. Direct bounce -- prior CREATE-BALANCE JournalEntry exists, status
+         now BOUNCED -> reversing entry posted, credit AR — Tenants, debit
+         Bounced Cheques, reversed_journal_entry FK -> the CREATE-BALANCE
+         entry.
+      2. Duplicate sync -- the same transition synced twice is a no-op the
+         second time, exactly one reversing entry total.
+      3. No prior posting -- no JournalEntry exists at all for this
+         lease_transaction_id -> logged error, no reversal posted.
+      4. Two independent bounced cheques -- two distinct
+         lease_transaction_ids, each with its own prior posting, both post
+         their own independent reversal.
+
+    Plus a dedicated test confirming the original JournalEntry/LedgerLines
+    are never modified (spec Never / AD-16).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_leasetransaction (
+                    id BIGSERIAL PRIMARY KEY,
+                    lease_id BIGINT NOT NULL,
+                    amount DOUBLE PRECISION,
+                    cheque_type VARCHAR(20) NOT NULL,
+                    payment_type VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_lease (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS lease_leasetransaction")
+            cursor.execute("DROP TABLE IF EXISTS lease_lease")
+            cursor.execute("DROP TABLE IF EXISTS property_unit")
+            cursor.execute("DROP TABLE IF EXISTS property_property")
+        super().tearDownClass()
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            for table in (
+                "lease_leasetransaction",
+                "lease_lease",
+                "property_unit",
+                "property_property",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _insert_chain(
+        self,
+        cursor,
+        txn_id,
+        lease_id,
+        unit_id,
+        property_id,
+        pmc_id,
+        cheque_type="RENT_CHEQUE",
+        amount=5000,
+        status="BALANCE",
+    ):
+        cursor.execute(
+            """
+            INSERT INTO lease_leasetransaction
+                (id, lease_id, amount, cheque_type, payment_type, status)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            [txn_id, lease_id, amount, cheque_type, "CHEQUE", status],
+        )
+        cursor.execute(
+            "INSERT INTO lease_lease (id, unit_id) VALUES (%s, %s)",
+            [lease_id, unit_id],
+        )
+        cursor.execute(
+            "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+            [unit_id, property_id],
+        )
+        cursor.execute(
+            "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+            [property_id, pmc_id],
+        )
+
+    def _set_status(self, cursor, txn_id, status):
+        cursor.execute(
+            "UPDATE lease_leasetransaction SET status = %s WHERE id = %s",
+            [status, txn_id],
+        )
+
+    def _make_profile(self, pmc_id=1):
+        return FinancePMCProfile.objects.create(
+            pmc_id=pmc_id,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+    def test_direct_bounce_posts_reversing_journal_entry(self):
+        profile = self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=300,
+                lease_id=30,
+                unit_id=40,
+                property_id=50,
+                pmc_id=1,
+                amount=5000,
+                status="BALANCE",
+            )
+
+        rent_result = post_rent_ar(300)
+        self.assertTrue(rent_result["posted"])
+        original_entry = JournalEntry.objects.get(
+            source_lease_transaction_id=300,
+            source_status_transition="CREATE-BALANCE",
+        )
+
+        with connection.cursor() as cursor:
+            self._set_status(cursor, 300, "BOUNCED")
+
+        result = post_bounce_reversal(300)
+
+        self.assertTrue(result["posted"])
+        entries = JournalEntry.objects.filter(
+            source_lease_transaction_id=300,
+            source_status_transition="BALANCE-BOUNCED",
+        )
+        self.assertEqual(entries.count(), 1)
+        entry = entries.first()
+        self.assertEqual(entry.finance_pmc_profile_id, profile.id)
+        self.assertEqual(entry.reversed_journal_entry_id, original_entry.id)
+
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 2)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        bounced_line = lines.get(account__name="Bounced Cheques")
+        self.assertEqual(ar_line.debit, 0)
+        self.assertEqual(ar_line.credit, 5000)
+        self.assertEqual(bounced_line.debit, 5000)
+        self.assertEqual(bounced_line.credit, 0)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 5000)
+
+        # Exactly two JournalEntries total for this lease_transaction_id --
+        # the original Rent AR posting plus this reversal.
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=300).count(), 2
+        )
+
+    def test_duplicate_sync_is_skipped(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=301,
+                lease_id=31,
+                unit_id=41,
+                property_id=51,
+                pmc_id=1,
+                amount=3000,
+                status="BALANCE",
+            )
+
+        self.assertTrue(post_rent_ar(301)["posted"])
+
+        with connection.cursor() as cursor:
+            self._set_status(cursor, 301, "BOUNCED")
+
+        first = post_bounce_reversal(301)
+        second = post_bounce_reversal(301)
+
+        self.assertTrue(first["posted"])
+        self.assertFalse(second["posted"])
+        self.assertEqual(second["reason"], "duplicate_skip")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=301,
+                source_status_transition="BALANCE-BOUNCED",
+            ).count(),
+            1,
+        )
+
+    def test_no_prior_posting_fails_loudly(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=302,
+                lease_id=32,
+                unit_id=42,
+                property_id=52,
+                pmc_id=1,
+                amount=1000,
+                status="BOUNCED",
+            )
+
+        result = post_bounce_reversal(302)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_prior_posting")
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=302).count(), 0
+        )
+
+    def test_two_independent_bounced_cheques_each_post_own_reversal(self):
+        profile = self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=303,
+                lease_id=33,
+                unit_id=43,
+                property_id=53,
+                pmc_id=1,
+                amount=2000,
+                status="BALANCE",
+            )
+            self._insert_chain(
+                cursor,
+                txn_id=304,
+                lease_id=34,
+                unit_id=44,
+                property_id=54,
+                pmc_id=1,
+                amount=6000,
+                status="BALANCE",
+            )
+
+        self.assertTrue(post_rent_ar(303)["posted"])
+        self.assertTrue(post_rent_ar(304)["posted"])
+
+        with connection.cursor() as cursor:
+            self._set_status(cursor, 303, "BOUNCED")
+            self._set_status(cursor, 304, "BOUNCED")
+
+        result_303 = post_bounce_reversal(303)
+        result_304 = post_bounce_reversal(304)
+
+        self.assertTrue(result_303["posted"])
+        self.assertTrue(result_304["posted"])
+
+        entry_303 = JournalEntry.objects.get(
+            source_lease_transaction_id=303,
+            source_status_transition="BALANCE-BOUNCED",
+        )
+        entry_304 = JournalEntry.objects.get(
+            source_lease_transaction_id=304,
+            source_status_transition="BALANCE-BOUNCED",
+        )
+
+        lines_303 = LedgerLine.objects.filter(journal_entry=entry_303)
+        lines_304 = LedgerLine.objects.filter(journal_entry=entry_304)
+        self.assertEqual(
+            sum(line.debit for line in lines_303),
+            sum(line.credit for line in lines_303),
+        )
+        self.assertEqual(sum(line.debit for line in lines_303), 2000)
+        self.assertEqual(
+            sum(line.debit for line in lines_304),
+            sum(line.credit for line in lines_304),
+        )
+        self.assertEqual(sum(line.debit for line in lines_304), 6000)
+
+        # No shared idempotency state -- each id has exactly its own two
+        # entries (CREATE-BALANCE + BALANCE-BOUNCED).
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=303).count(), 2
+        )
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=304).count(), 2
+        )
+
+    def test_original_journal_entry_and_ledger_lines_never_modified(self):
+        """AD-16: the reversal is additive-only -- the original CREATE-*
+        JournalEntry and its LedgerLines must be byte-for-byte unchanged
+        after the reversal posts."""
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=305,
+                lease_id=35,
+                unit_id=45,
+                property_id=55,
+                pmc_id=1,
+                amount=4500,
+                status="BALANCE",
+            )
+
+        self.assertTrue(post_rent_ar(305)["posted"])
+        original_entry = JournalEntry.objects.get(
+            source_lease_transaction_id=305,
+            source_status_transition="CREATE-BALANCE",
+        )
+        original_lines_before = list(
+            LedgerLine.objects.filter(journal_entry=original_entry)
+            .order_by("id")
+            .values("id", "account_id", "debit", "credit")
+        )
+        original_posted_at_before = original_entry.posted_at
+
+        with connection.cursor() as cursor:
+            self._set_status(cursor, 305, "BOUNCED")
+
+        result = post_bounce_reversal(305)
+        self.assertTrue(result["posted"])
+
+        original_entry.refresh_from_db()
+        self.assertEqual(original_entry.posted_at, original_posted_at_before)
+        self.assertEqual(
+            original_entry.source_status_transition, "CREATE-BALANCE"
+        )
+        self.assertIsNone(original_entry.reversed_journal_entry_id)
+
+        original_lines_after = list(
+            LedgerLine.objects.filter(journal_entry=original_entry)
+            .order_by("id")
+            .values("id", "account_id", "debit", "credit")
+        )
+        self.assertEqual(original_lines_before, original_lines_after)
+
+        # The original entry still exists (never deleted).
+        self.assertTrue(
+            JournalEntry.objects.filter(pk=original_entry.pk).exists()
+        )
+
+    def test_no_original_create_entry_fails_loudly(self):
+        """If the RENT AR posting never happened (no CREATE-* entry exists
+        at all), the reversal must fail rather than reverse against nothing
+        -- distinct from the no-prior-posting-at-all path since here some
+        (non-CREATE) prior JournalEntry does exist."""
+        profile = self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=306,
+                lease_id=36,
+                unit_id=46,
+                property_id=56,
+                pmc_id=1,
+                amount=1000,
+                status="BALANCE",
+            )
+
+        # Manually seed a prior JournalEntry with a non-CREATE transition --
+        # simulates a data state where some entry exists but not the
+        # original Rent AR posting.
+        ar_account = Account.objects.get(
+            finance_pmc_profile=profile, name="AR — Tenants"
+        )
+        bank_account = Account.objects.get(
+            finance_pmc_profile=profile, name="Bank"
+        )
+        entry = JournalEntry.objects.create(
+            finance_pmc_profile=profile,
+            source_lease_transaction_id=306,
+            source_status_transition="BALANCE-CREDITED",
+        )
+        LedgerLine.objects.create(
+            journal_entry=entry, account=bank_account, debit=1000, credit=0
+        )
+        LedgerLine.objects.create(
+            journal_entry=entry, account=ar_account, debit=0, credit=1000
+        )
+
+        with connection.cursor() as cursor:
+            self._set_status(cursor, 306, "BOUNCED")
+
+        result = post_bounce_reversal(306)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_original_posting")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=306,
+                source_status_transition="CREDITED-BOUNCED",
+            ).count(),
+            0,
+        )
+
+    def test_not_bounced_status_is_noop(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=307,
+                lease_id=37,
+                unit_id=47,
+                property_id=57,
+                pmc_id=1,
+                amount=1000,
+                status="REALIZED",
+            )
+
+        result = post_bounce_reversal(307)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "not_bounced_status")
+
+    def test_no_prior_posting_and_no_profile_posts_nothing(self):
+        """Renamed from test_unresolvable_pmc_posts_nothing (post-review):
+        this scenario has no FinancePMCProfile AND no prior JournalEntry, so
+        no_prior_posting fires before ever reaching the PMC-resolution code
+        -- it does not exercise post_bounce_reversal's own unresolvable_pmc
+        branch. See test_unresolvable_pmc_posts_nothing below for that."""
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=308,
+                lease_id=38,
+                unit_id=48,
+                property_id=58,
+                pmc_id=1,
+                amount=1000,
+                status="BOUNCED",
+            )
+
+        result = post_bounce_reversal(308)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_prior_posting")
+
+    def test_unresolvable_pmc_posts_nothing(self):
+        """Post-review patch: genuinely exercises post_bounce_reversal's own
+        unresolvable_pmc branch -- a real prior CREATE-* entry exists (so
+        both the prior-posting and original-entry checks pass), but the
+        chain breaks (no Property row for the Unit's parent_property_id) by
+        the time the reversal tries to resolve the PMC."""
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=309,
+                lease_id=39,
+                unit_id=49,
+                property_id=59,
+                pmc_id=1,
+                amount=1500,
+                status="BALANCE",
+            )
+
+        self.assertTrue(post_rent_ar(309)["posted"])
+
+        with connection.cursor() as cursor:
+            # Break the chain after the CREATE-BALANCE entry already exists:
+            # delete the Property row the Unit points at.
+            cursor.execute("DELETE FROM property_property WHERE id = %s", [59])
+            self._set_status(cursor, 309, "BOUNCED")
+
+        result = post_bounce_reversal(309)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "unresolvable_pmc")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=309,
+                source_status_transition="BALANCE-BOUNCED",
+            ).count(),
+            0,
+        )

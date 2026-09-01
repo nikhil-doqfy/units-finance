@@ -8,6 +8,12 @@ every new `FinancePMCProfile`, and the helper that bulk-creates them.
 This is not a CoA editor or a configurable fixture: the list below is the
 entire Phase 1 Chart of Accounts, fixed in code (spec Never: no CLI flags,
 no settings-based configuration, no per-PMC customization).
+
+Story 2.4 adds "Bounced Cheques" (Asset type — represents money the tenant
+still owes, structurally like AR) to this list. It was never part of Story
+1.3's original 8-account seed; existing `FinancePMCProfile`s created before
+Story 2.4 shipped will NOT retroactively get it (no seed-backfill mechanism
+exists — accepted known gap, see spec Verification).
 """
 from ledger.models import Account
 
@@ -23,6 +29,7 @@ STANDARD_CHART_OF_ACCOUNTS = [
     ("AP — PMC Commission", Account.LIABILITY),
     ("Commission Expense", Account.EXPENSE),
     ("Bank Charges/Fees", Account.EXPENSE),
+    ("Bounced Cheques", Account.ASSET),
 ]
 
 

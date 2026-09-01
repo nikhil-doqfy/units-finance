@@ -6,14 +6,20 @@ Story 2.1b: the receiving end of units-backend's internal sync channel
 @require_internal_token (AD-7). Story 2.2b wired the Rent AR posting engine
 in here in place of the previous bare acknowledgment: a RENT-type
 LeaseTransaction (`cheque_type == RENT_CHEQUE`) triggers `post_rent_ar`.
-Story 2.3 adds `post_cheque_clearing` alongside it -- both checks run on
-every sync call, each independently no-oping when its own trigger condition
-isn't met (deliberately not gated on cheque_type, per Spec Change Log).
+Story 2.3 adds `post_cheque_clearing` alongside it, and Story 2.4 adds
+`post_bounce_reversal` alongside both -- all three checks run on every sync
+call, each independently no-oping when its own trigger condition isn't met
+(deliberately not gated on cheque_type, per Spec Change Log).
 """
 from rest_framework.decorators import api_view
 
 from ledger.decorators import require_internal_token
-from ledger.posting import RENT_CHEQUE, post_cheque_clearing, post_rent_ar
+from ledger.posting import (
+    RENT_CHEQUE,
+    post_bounce_reversal,
+    post_cheque_clearing,
+    post_rent_ar,
+)
 from ledger.models import LeaseTransactionRef
 from ledger.response_envelope import prepare_response
 
@@ -59,6 +65,13 @@ def sync_lease_transaction(request, lease_transaction_id):
         # every sync regardless of cheque_type; the existing prior-
         # JournalEntry check inside post_cheque_clearing is the sole gate.
         posting_results["cheque_clearing"] = post_cheque_clearing(
+            lease_transaction_id, txn=txn
+        )
+
+        # Story 2.4: also NOT gated on cheque_type (same precedent) -- the
+        # sole gate is status == BOUNCED plus post_bounce_reversal's own
+        # prior-posting/idempotency checks.
+        posting_results["bounce_reversal"] = post_bounce_reversal(
             lease_transaction_id, txn=txn
         )
 

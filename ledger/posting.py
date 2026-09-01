@@ -35,6 +35,23 @@ prior posting at all (e.g. a non-RENT type that never had a Rent AR
 posting) correctly and intentionally hits the "no prior posting" failure
 path below -- this naturally excludes cheque types with nothing to clear,
 without a separate `cheque_type` filter.
+
+Story 2.4: Bounce reversal posting.
+
+`post_bounce_reversal` posts a reversing Journal Entry (credit AR —
+Tenants, debit Bounced Cheques) when a `LeaseTransaction.status` is
+currently `BOUNCED`. The "from" status is inferred the same way Story 2.3
+does -- from the most recent prior `JournalEntry`'s "to" side -- but the
+`reversed_journal_entry` FK is deliberately NOT set to that most-recent
+entry: it always points at the original Rent AR posting (the `CREATE-*`
+entry) for this `lease_transaction_id`, found by filtering for
+`source_status_transition` starting with `"CREATE-"` (Design Notes; AD-16).
+If no prior `JournalEntry` exists at all, or no `CREATE-*` entry exists
+among them, this fails loudly -- there's nothing to reverse.
+
+Also NOT gated on `cheque_type` (same Story 2.3 precedent, spec Boundaries
+& Constraints): the sole gate is status == BOUNCED plus the existing
+prior-posting/idempotency checks.
 """
 import logging
 
@@ -63,6 +80,7 @@ CREATE_STATUS_TRANSITION = "CREATE-BALANCE"
 AR_TENANTS_ACCOUNT_NAME = "AR — Tenants"
 RENT_INCOME_ACCOUNT_NAME = "Rent Income"
 BANK_ACCOUNT_NAME = "Bank"
+BOUNCED_CHEQUES_ACCOUNT_NAME = "Bounced Cheques"
 
 # Trigger statuses for Story 2.3's cheque clearing posting -- a cheque is
 # "cleared" once it reaches either of these (per the existing units-backend
@@ -70,6 +88,15 @@ BANK_ACCOUNT_NAME = "Bank"
 CHEQUE_STATUS_CREDITED = "CREDITED"
 CHEQUE_STATUS_REALIZED = "REALIZED"
 CLEARING_TRIGGER_STATUSES = (CHEQUE_STATUS_CREDITED, CHEQUE_STATUS_REALIZED)
+
+# Trigger status for Story 2.4's bounce reversal posting.
+CHEQUE_STATUS_BOUNCED = "BOUNCED"
+
+# Prefix identifying the original Rent AR posting's source_status_transition
+# among a lease_transaction_id's JournalEntry history (Design Notes; AD-16) --
+# always "CREATE-<something>", exactly one per id since post_rent_ar posts
+# once, guarded by its own idempotency check.
+CREATE_TRANSITION_PREFIX = "CREATE-"
 
 
 def post_rent_ar(lease_transaction_id, txn=None):
@@ -427,5 +454,229 @@ def post_cheque_clearing(lease_transaction_id, txn=None):
         profile.pmc_id,
         amount,
         transition,
+    )
+    return {"posted": True, "reason": ""}
+
+
+def post_bounce_reversal(lease_transaction_id, txn=None):
+    """Post a reversing Journal Entry when a cheque bounces.
+
+    `txn` may be passed in by a caller that has already fetched the
+    `LeaseTransactionRef` (mirrors `post_rent_ar`/`post_cheque_clearing`'s
+    `txn` param) -- avoids a second, redundant query for the same row. If
+    omitted, this function fetches it itself.
+
+    Returns a dict: {"posted": bool, "reason": str} -- same shape/contract as
+    `post_rent_ar`/`post_cheque_clearing`. Never raises for an expected
+    failure path; only a genuinely unexpected DB error propagates out of the
+    atomic block.
+
+    Deliberately NOT gated on `cheque_type` (spec Boundaries & Constraints,
+    same Story 2.3 precedent) -- the sole gate is status == BOUNCED plus the
+    existing prior-posting/idempotency checks below.
+    """
+    if txn is None:
+        txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
+    if txn is None:
+        logger.error(
+            "post_bounce_reversal: no LeaseTransaction found for id=%s -- "
+            "cannot post",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "lease_transaction_not_found"}
+
+    current_status = txn.status
+    if current_status != CHEQUE_STATUS_BOUNCED:
+        # Not this story's trigger -- correctly a no-op, not a failure.
+        return {"posted": False, "reason": "not_bounced_status"}
+
+    if txn.amount is None:
+        logger.error(
+            "post_bounce_reversal: LeaseTransaction id=%s has a null amount "
+            "-- cannot post",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "missing_amount"}
+
+    # Infer the "from" status from Finance's own JournalEntry history --
+    # same mechanism as post_cheque_clearing (Design Notes). The most recent
+    # prior entry's "to" side is the last-known-posted status, i.e. this
+    # posting's "from" side.
+    prior_entry = (
+        JournalEntry.objects.filter(source_lease_transaction_id=lease_transaction_id)
+        .order_by("-posted_at", "-id")
+        .first()
+    )
+    if prior_entry is None:
+        logger.error(
+            "post_bounce_reversal: no prior JournalEntry exists for "
+            "lease_transaction_id=%s -- the RENT AR posting never happened, "
+            "cannot reverse",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "no_prior_posting"}
+
+    last_known_status = prior_entry.source_status_transition.split("-")[-1]
+
+    if last_known_status == current_status:
+        # Self-loop -- the most recent posting already landed this exact
+        # status (e.g. a retried sync call re-delivering the same event).
+        # Skip without fabricating a nonsensical "X-X" transition.
+        logger.info(
+            "post_bounce_reversal: lease_transaction_id=%s already reversed "
+            "to status=%s -- skipping duplicate post",
+            lease_transaction_id,
+            current_status,
+        )
+        return {"posted": False, "reason": "duplicate_skip"}
+
+    transition = f"{last_known_status}-{current_status}"
+
+    if JournalEntry.objects.filter(
+        source_lease_transaction_id=lease_transaction_id,
+        source_status_transition=transition,
+    ).exists():
+        logger.info(
+            "post_bounce_reversal: JournalEntry already exists for "
+            "lease_transaction_id=%s transition=%s -- skipping duplicate post",
+            lease_transaction_id,
+            transition,
+        )
+        return {"posted": False, "reason": "duplicate_skip"}
+
+    # The reversed_journal_entry FK must point at the ORIGINAL Rent AR
+    # posting (the CREATE-* entry), never the most-recently-inferred "from"
+    # entry above, which may itself already be a clearing/other reversal
+    # (Design Notes; AD-16). Exactly one CREATE-* entry per id, since
+    # post_rent_ar posts once, guarded by its own idempotency check.
+    original_entry = (
+        JournalEntry.objects.filter(
+            source_lease_transaction_id=lease_transaction_id,
+            source_status_transition__startswith=CREATE_TRANSITION_PREFIX,
+        )
+        .order_by("-posted_at", "-id")
+        .first()
+    )
+    if original_entry is None:
+        logger.error(
+            "post_bounce_reversal: no original CREATE-* JournalEntry exists "
+            "for lease_transaction_id=%s -- nothing to reverse",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "no_original_posting"}
+
+    # Walk the same PMC resolution chain post_rent_ar/post_cheque_clearing
+    # use -- no new resolution mechanism (spec Boundaries & Constraints).
+    lease = LeaseRef.objects.filter(pk=txn.lease_id).first()
+    if lease is None:
+        logger.error(
+            "post_bounce_reversal: unresolvable PMC for lease_transaction_id="
+            "%s -- no Lease found for lease_id=%s",
+            lease_transaction_id,
+            txn.lease_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    unit = UnitRef.objects.filter(pk=lease.unit_id).first()
+    if unit is None:
+        logger.error(
+            "post_bounce_reversal: unresolvable PMC for lease_transaction_id="
+            "%s -- no Unit found for unit_id=%s",
+            lease_transaction_id,
+            lease.unit_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    property_ = PropertyRef.objects.filter(pk=unit.parent_property_id).first()
+    if property_ is None:
+        logger.error(
+            "post_bounce_reversal: unresolvable PMC for lease_transaction_id="
+            "%s -- no Property found for parent_property_id=%s",
+            lease_transaction_id,
+            unit.parent_property_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    profile = FinancePMCProfile.objects.filter(pmc_id=property_.pmc_id).first()
+    if profile is None:
+        logger.error(
+            "post_bounce_reversal: unresolvable PMC for lease_transaction_id="
+            "%s -- no FinancePMCProfile found for pmc_id=%s",
+            lease_transaction_id,
+            property_.pmc_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    # Reversal amount always matches the ORIGINAL Rent AR posting's amount
+    # for this lease_transaction_id -- read from LeaseTransactionRef.amount
+    # (same field, same value, consistent with Stories 2.2b/2.3's
+    # convention), not recomputed (spec Boundaries & Constraints).
+    amount = txn.amount
+
+    try:
+        ar_account = Account.objects.get(
+            finance_pmc_profile=profile, name=AR_TENANTS_ACCOUNT_NAME
+        )
+        bounced_cheques_account = Account.objects.get(
+            finance_pmc_profile=profile, name=BOUNCED_CHEQUES_ACCOUNT_NAME
+        )
+    except Account.DoesNotExist:
+        logger.error(
+            "post_bounce_reversal: Chart of Accounts not configured for "
+            "FinancePMCProfile pmc_id=%s (lease_transaction_id=%s) -- "
+            "expected Accounts named %r and %r",
+            profile.pmc_id,
+            lease_transaction_id,
+            AR_TENANTS_ACCOUNT_NAME,
+            BOUNCED_CHEQUES_ACCOUNT_NAME,
+        )
+        return {"posted": False, "reason": "chart_of_accounts_not_configured"}
+
+    with transaction.atomic():
+        entry = JournalEntry.objects.create(
+            finance_pmc_profile=profile,
+            source_lease_transaction_id=lease_transaction_id,
+            source_status_transition=transition,
+            reversed_journal_entry=original_entry,
+        )
+
+        # Credit AR — Tenants, debit Bounced Cheques -- the cheque never
+        # cleared the bank, so it never touches Bank (spec Intent).
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=bounced_cheques_account,
+            debit=amount,
+            credit=0,
+        )
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=ar_account,
+            debit=0,
+            credit=amount,
+        )
+
+        debit_total = sum(line.debit for line in entry.lines.all())
+        credit_total = sum(line.credit for line in entry.lines.all())
+        if debit_total != credit_total or debit_total != amount:
+            # Same explicit if/raise balance check as post_rent_ar/
+            # post_cheque_clearing -- never `assert` (NFR-1). Raising here
+            # rolls back the whole atomic block.
+            raise ValueError(
+                f"post_bounce_reversal: unbalanced entry for "
+                f"lease_transaction_id={lease_transaction_id} "
+                f"(debit={debit_total}, credit={credit_total}, "
+                f"amount={amount})"
+            )
+
+    logger.info(
+        "post_bounce_reversal: posted JournalEntry id=%s for "
+        "lease_transaction_id=%s (pmc_id=%s, amount=%s, transition=%s, "
+        "reversed_journal_entry_id=%s)",
+        entry.id,
+        lease_transaction_id,
+        profile.pmc_id,
+        amount,
+        transition,
+        original_entry.id,
     )
     return {"posted": True, "reason": ""}

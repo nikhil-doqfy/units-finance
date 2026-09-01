@@ -134,9 +134,10 @@ class JournalEntry(models.Model):
         blank=True,
         related_name="reversing_entries",
         help_text="FK to the original entry if this is a reversal; additive-only "
-        "reversals, unused until Story 2.6 (AD-16). Django auto-derives the "
-        "'reversed_journal_entry_id' db column from this field name, matching "
-        "the ARCHITECTURE-SPINE ER diagram's column name exactly.",
+        "reversals, first populated by Story 2.4's post_bounce_reversal (AD-16). "
+        "Django auto-derives the 'reversed_journal_entry_id' db column from "
+        "this field name, matching the ARCHITECTURE-SPINE ER diagram's "
+        "column name exactly.",
     )
     posted_at = models.DateTimeField(auto_now_add=True)
 
