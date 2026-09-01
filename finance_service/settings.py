@@ -24,6 +24,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
     'ledger',
 ]
 
@@ -95,3 +96,8 @@ STATIC_URL = '/static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Shared secret checked on every request under the /internal/ namespace
+# (AD-7, Story 2.1b). Sourced from the root .env, already added by Story 2.1a
+# for units-backend's side of the channel; Finance only reads it here.
+FINANCE_INTERNAL_TOKEN = os.getenv("FINANCE_INTERNAL_TOKEN")

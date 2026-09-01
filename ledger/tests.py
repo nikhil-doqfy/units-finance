@@ -19,7 +19,8 @@ importing units-backend's code (consistent with the spec's Design Notes).
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.urls import reverse
 
 from ledger.models import Account, FinancePMCProfile
 from ledger.seed import STANDARD_CHART_OF_ACCOUNTS
@@ -270,3 +271,165 @@ class SeedStandardChartOfAccountsTests(TestCase):
             Account.objects.filter(finance_pmc_profile=profile).count(),
             len(STANDARD_CHART_OF_ACCOUNTS),
         )
+
+
+@override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token")
+class SyncLeaseTransactionEndpointTests(TestCase):
+    """Story 2.1b tests: the internal sync endpoint + token auth.
+
+    Covers all four I/O matrix rows from the spec:
+      1. Happy path -- valid token, consistent path/body id -> 200 ack.
+      2. Missing token -> 401, rejected before any view logic runs.
+      3. Wrong token -> 403, rejected before any view logic runs.
+      4. Path/body id mismatch -> 400 naming the mismatch.
+    """
+
+    def _url(self, lease_transaction_id):
+        return reverse(
+            "sync-lease-transaction",
+            kwargs={"lease_transaction_id": lease_transaction_id},
+        )
+
+    def test_happy_path_returns_200_ack(self):
+        response = self.client.post(
+            self._url(42),
+            data={"lease_transaction_id": 42},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], 200)
+        self.assertEqual(body["content"], {"lease_transaction_id": 42})
+        self.assertTrue(body["message"])
+
+    def test_happy_path_with_only_path_id_returns_200_ack(self):
+        """Body is optional -- the URL path param alone is sufficient."""
+        response = self.client.post(
+            self._url(42),
+            data={},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"], {"lease_transaction_id": 42})
+
+    def test_missing_token_rejected_with_401(self):
+        response = self.client.post(
+            self._url(42),
+            data={"lease_transaction_id": 42},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+        body = response.json()
+        self.assertEqual(body["status"], 401)
+        self.assertTrue(body["message"])
+
+    def test_wrong_token_rejected_with_403(self):
+        response = self.client.post(
+            self._url(42),
+            data={"lease_transaction_id": 42},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="wrong-token",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        body = response.json()
+        self.assertEqual(body["status"], 403)
+        self.assertTrue(body["message"])
+
+    def test_path_body_id_mismatch_rejected_with_400(self):
+        response = self.client.post(
+            self._url(42),
+            data={"lease_transaction_id": 99},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["status"], 400)
+        self.assertTrue(body["message"])
+        self.assertEqual(body["content"]["path_lease_transaction_id"], 42)
+        self.assertEqual(body["content"]["body_lease_transaction_id"], 99)
+
+    def test_missing_token_rejected_before_mismatch_check(self):
+        """Token check happens before any other processing, including the
+        path/body consistency check -- a mismatched body with no token still
+        surfaces as 401, not 400."""
+        response = self.client.post(
+            self._url(42),
+            data={"lease_transaction_id": 99},
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_no_trailing_slash_url_also_works(self):
+        """units-backend's real sender (lease/finance_sync.py) posts without
+        a trailing slash; this must not 404 or redirect-and-drop the POST."""
+        response = self.client.post(
+            reverse(
+                "sync-lease-transaction-no-slash",
+                kwargs={"lease_transaction_id": 42},
+            ),
+            data={"lease_transaction_id": 42},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"], {"lease_transaction_id": 42})
+
+    def test_string_body_id_matching_path_id_is_accepted(self):
+        """A JSON string '42' for the body id is coerced and compared as an
+        int against the path-converted lease_transaction_id -- a real
+        sender serialization change (int -> numeric string) must not start
+        rejecting every sync call with a spurious 400."""
+        response = self.client.post(
+            self._url(42),
+            data={"lease_transaction_id": "42"},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"], {"lease_transaction_id": 42})
+
+    def test_non_integer_body_id_rejected_with_400(self):
+        response = self.client.post(
+            self._url(42),
+            data={"lease_transaction_id": "not-a-number"},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["content"]["body_lease_transaction_id"], "not-a-number"
+        )
+
+    def test_disallowed_method_rejected_with_405(self):
+        response = self.client.get(
+            self._url(42), HTTP_X_INTERNAL_TOKEN="test-internal-token"
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+    @override_settings(FINANCE_INTERNAL_TOKEN=None)
+    def test_unset_finance_internal_token_fails_loud_with_500(self):
+        """A misconfigured environment (FINANCE_INTERNAL_TOKEN never set)
+        must not silently behave like every caller sent an invalid token --
+        it's an operator error, not a caller error, so this fails loud with
+        500 rather than a misleading 403."""
+        response = self.client.post(
+            self._url(42),
+            data={"lease_transaction_id": 42},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="anything",
+        )
+
+        self.assertEqual(response.status_code, 500)
