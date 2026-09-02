@@ -4763,3 +4763,337 @@ class ProfitLossReportTests(TrialBalanceReportTests):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["content"]["net_profit_loss"], 100.0)
+
+
+class BalanceSheetReportTests(TrialBalanceReportTests):
+    """Story 3.4 tests: GET /reports/balance-sheet.
+
+    Subclasses `TrialBalanceReportTests` to reuse its stand-in-table setup
+    (Owner-branch PMC scoping) and helpers (`_make_profile`,
+    `_post_journal_entry`, `_make_owner_with_pmc`). Covers all four I/O
+    matrix rows from the spec:
+      1. Happy path -- Asset/Liability accounts + derived Retained Earnings
+         Equity line, balanced: true.
+      2. Equation holds with real activity across Income/Expense/Asset/
+         Liability postings.
+      3. as_of_date before profile creation -- valid degenerate empty
+         window, all zero, balanced: true (not an error).
+      4. Unreachable/nonexistent pmc_id, invalid/missing as_of_date,
+         unauthenticated -- same rejections as Story 3.2/3.3.
+
+    Date-range-specific tests inherited from the parent class don't apply
+    to this single-`as_of_date`-param endpoint -- skipped/overridden below,
+    same pattern `ProfitLossReportTests` uses.
+    """
+
+    def _url(self):
+        return reverse("balance-sheet-report")
+
+    # Trial-Balance-specific tests inherited from the parent class assert on
+    # `start_date`/`end_date` query params and the `accounts`/`balanced`
+    # response shape, which doesn't match this single-`as_of_date` endpoint;
+    # this subclass adds its own Balance-Sheet-shaped equivalents below and
+    # keeps only the auth/scoping rejection tests that are param-agnostic.
+    def test_happy_path_returns_every_account_balanced_true(self):
+        self.skipTest("covered by this class's own happy-path test below")
+
+    def test_zero_activity_account_included_with_zero_totals(self):
+        self.skipTest("covered by this class's own tests below")
+
+    def test_reversal_entry_summed_unconditionally(self):
+        self.skipTest("covered by this class's own tests below (reuses "
+                       "compute_trial_balance, already tested there)")
+
+    def test_missing_date_range_rejected_with_400(self):
+        self.skipTest("covered by this class's own missing-as_of_date test below")
+
+    def test_invalid_date_format_rejected_with_400(self):
+        self.skipTest("covered by this class's own invalid-as_of_date test below")
+
+    def test_inverted_date_range_rejected_with_400(self):
+        self.skipTest("not applicable -- single as_of_date param, no range to invert")
+
+    def test_no_trailing_slash_url_also_works(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=201)
+        # Backdate `created` (auto_now_add) so the since-inception window
+        # actually covers `posted_at` below, decoupling this test from
+        # wall-clock time (same reasoning as the happy-path test above).
+        FinancePMCProfile.objects.filter(pk=profile.pk).update(
+            created=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        )
+        profile.refresh_from_db()
+        token = self._make_token("bsowner201@example.com")
+        self._make_owner_with_pmc(
+            201,
+            "bsowner201@example.com",
+            token,
+            401,
+            unit_id=2010,
+            property_id=3010,
+            pmc_id=201,
+        )
+        posted_at = dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc)
+        self._post_journal_entry(
+            profile,
+            "CREATE-BALANCE",
+            [("AR — Tenants", 100, 0), ("Rent Income", 0, 100)],
+            posted_at=posted_at,
+            source_txn_id=2001,
+        )
+
+        response = self.client.get(
+            reverse("balance-sheet-report-no-slash"),
+            {"pmc_id": 201, "as_of_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        content = response.json()["content"]
+        ar_tenants = next(
+            a for a in content["asset_accounts"] if a["name"] == "AR — Tenants"
+        )
+        self.assertEqual(ar_tenants["balance"], 100.0)
+        self.assertTrue(response.json()["content"]["balanced"])
+
+    def test_unauthenticated_request_rejected_with_401_before_any_query(self):
+        self._make_profile(pmc_id=202)
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 202, "as_of_date": "2026-06-30"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["status"], 401)
+
+    def test_expired_token_rejected_with_401(self):
+        token = self._make_token("bsowner203@example.com", exp_delta_seconds=-10)
+        self._make_profile(pmc_id=203)
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 203, "as_of_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_unreachable_pmc_id_rejected_with_403(self):
+        self._make_profile(pmc_id=204)
+        # Owner is scoped to pmc_id=205, not pmc_id=204.
+        token = self._make_token("bsowner204@example.com")
+        self._make_owner_with_pmc(
+            204, "bsowner204@example.com", token, 404, unit_id=2040, property_id=3040, pmc_id=205
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 204, "as_of_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["status"], 403)
+
+    def test_nonexistent_pmc_id_rejected_with_404(self):
+        token = self._make_token("bsowner205@example.com")
+        self._make_owner_with_pmc(
+            205, "bsowner205@example.com", token, 405, unit_id=2050, property_id=3050, pmc_id=999
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 999, "as_of_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["status"], 404)
+
+    def test_missing_as_of_date_rejected_with_400(self):
+        self._make_profile(pmc_id=206)
+        token = self._make_token("bsowner206@example.com")
+        self._make_owner_with_pmc(
+            206, "bsowner206@example.com", token, 406, unit_id=2060, property_id=3060, pmc_id=206
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 206},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile__pmc_id=206).count(), 0
+        )
+
+    def test_invalid_as_of_date_format_rejected_with_400(self):
+        self._make_profile(pmc_id=207)
+        token = self._make_token("bsowner207@example.com")
+        self._make_owner_with_pmc(
+            207, "bsowner207@example.com", token, 407, unit_id=2070, property_id=3070, pmc_id=207
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 207, "as_of_date": "not-a-date"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_happy_path_returns_asset_liability_and_retained_earnings(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=208)
+        # Backdate `created` (auto_now_add) to a fixed inception point, same
+        # pattern `_post_journal_entry` uses for `posted_at` -- so this test
+        # doesn't depend on wall-clock time being before 2026-06-15.
+        FinancePMCProfile.objects.filter(pk=profile.pk).update(
+            created=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        )
+        profile.refresh_from_db()
+        token = self._make_token("bsowner208@example.com")
+        self._make_owner_with_pmc(
+            208, "bsowner208@example.com", token, 408, unit_id=2080, property_id=3080, pmc_id=208
+        )
+
+        posted_at = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+        # Rent AR posting: debit AR — Tenants (Asset), credit Rent Income.
+        self._post_journal_entry(
+            profile,
+            "CREATE-BALANCE",
+            [("AR — Tenants", 5000, 0), ("Rent Income", 0, 5000)],
+            posted_at=posted_at,
+            source_txn_id=2081,
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 208, "as_of_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], 200)
+        content = body["content"]
+        self.assertTrue(content["balanced"])
+
+        asset_accounts = {a["name"]: a for a in content["asset_accounts"]}
+        liability_accounts = {a["name"]: a for a in content["liability_accounts"]}
+
+        # Only Asset accounts appear in asset_accounts, only Liability in
+        # liability_accounts -- Income/Expense/derived-Equity are excluded
+        # from those lists entirely.
+        self.assertIn("AR — Tenants", asset_accounts)
+        self.assertIn("Bank", asset_accounts)
+        self.assertNotIn("Rent Income", asset_accounts)
+        self.assertNotIn("Rent Income", liability_accounts)
+        self.assertIn("Security Deposits Held", liability_accounts)
+        self.assertIn("VAT Payable", liability_accounts)
+        self.assertIn("AP — PMC Commission", liability_accounts)
+
+        # AR — Tenants: debit-normal, 5000 - 0 = 5000.
+        self.assertEqual(asset_accounts["AR — Tenants"]["balance"], 5000.0)
+        # Bank had no activity -- present, zeroed.
+        self.assertEqual(asset_accounts["Bank"]["balance"], 0.0)
+
+        # Derived Retained Earnings: net_profit_loss since inception = 5000
+        # (Rent Income) - 0 (no expenses) = 5000.
+        self.assertEqual(content["equity"]["name"], "Retained Earnings")
+        self.assertEqual(content["equity"]["balance"], 5000.0)
+        self.assertNotIn("id", content["equity"])
+
+        # Assets == Liabilities + Equity: 5000 == 0 + 5000.
+        total_assets = sum(a["balance"] for a in asset_accounts.values())
+        total_liabilities = sum(a["balance"] for a in liability_accounts.values())
+        self.assertEqual(total_assets, total_liabilities + content["equity"]["balance"])
+
+    def test_equation_holds_with_real_activity(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=209)
+        # Backdate `created` (auto_now_add), same reasoning as the happy-path
+        # test above -- decouples the since-inception window from wall-clock
+        # time.
+        FinancePMCProfile.objects.filter(pk=profile.pk).update(
+            created=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        )
+        profile.refresh_from_db()
+        token = self._make_token("bsowner209@example.com")
+        self._make_owner_with_pmc(
+            209, "bsowner209@example.com", token, 409, unit_id=2090, property_id=3090, pmc_id=209
+        )
+
+        posted_at = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+        # Rent posted: Asset up (AR), Income up.
+        self._post_journal_entry(
+            profile,
+            "CREATE-BALANCE",
+            [("AR — Tenants", 10000, 0), ("Rent Income", 0, 10000)],
+            posted_at=posted_at,
+            source_txn_id=2091,
+        )
+        # Commission split posted: Liability up (AP credited, credit-normal),
+        # Expense up (Commission Expense debited, debit-normal) -- matching
+        # `post_commission_split`'s real convention.
+        self._post_journal_entry(
+            profile,
+            "COMMISSION-SPLIT",
+            [("Commission Expense", 800, 0), ("AP — PMC Commission", 0, 800)],
+            posted_at=posted_at,
+            source_txn_id=2091,
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 209, "as_of_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        content = response.json()["content"]
+        self.assertTrue(content["balanced"])
+
+        total_assets = sum(a["balance"] for a in content["asset_accounts"])
+        total_liabilities = sum(a["balance"] for a in content["liability_accounts"])
+        retained_earnings = content["equity"]["balance"]
+
+        # net_profit_loss = 10000 (Rent Income) - 800 (Commission Expense) = 9200.
+        self.assertEqual(retained_earnings, 9200.0)
+        # Assets: AR — Tenants = 10000. Liabilities: AP — PMC Commission = 800.
+        self.assertEqual(total_assets, 10000.0)
+        self.assertEqual(total_liabilities, 800.0)
+        self.assertEqual(total_assets, total_liabilities + retained_earnings)
+
+    def test_as_of_date_before_profile_creation_returns_zeroed_balanced_true(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=210)
+        token = self._make_token("bsowner210@example.com")
+        self._make_owner_with_pmc(
+            210, "bsowner210@example.com", token, 410, unit_id=2100, property_id=3100, pmc_id=210
+        )
+        # `created` is auto_now_add -- set to "now" (test run time), which is
+        # after this as_of_date (2020-01-01) regardless of when tests run,
+        # per the spec: a valid degenerate empty window, not an error.
+        self.assertTrue(profile.created.date() > dt.date(2020, 1, 1))
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 210, "as_of_date": "2020-01-01"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        content = response.json()["content"]
+        self.assertTrue(content["balanced"])
+        for account in content["asset_accounts"]:
+            self.assertEqual(account["balance"], 0.0)
+        for account in content["liability_accounts"]:
+            self.assertEqual(account["balance"], 0.0)
+        self.assertEqual(content["equity"]["balance"], 0.0)

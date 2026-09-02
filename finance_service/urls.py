@@ -3,6 +3,7 @@ from django.contrib import admin
 from django.urls import path
 
 from ledger.views import (
+    balance_sheet_report,
     profit_loss_report,
     sync_lease,
     sync_lease_transaction,
@@ -66,5 +67,18 @@ urlpatterns = [
         'reports/profit-loss',
         profit_loss_report,
         name='profit-loss-report-no-slash',
+    ),
+    # Story 3.4: Balance Sheet report -- trailing-slash + no-slash pair,
+    # matching the established route-pair precedent above (spec Boundaries
+    # & Constraints).
+    path(
+        'reports/balance-sheet/',
+        balance_sheet_report,
+        name='balance-sheet-report',
+    ),
+    path(
+        'reports/balance-sheet',
+        balance_sheet_report,
+        name='balance-sheet-report-no-slash',
     ),
 ]

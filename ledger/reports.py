@@ -127,3 +127,67 @@ def compute_profit_loss(finance_pmc_profile, start_date, end_date):
         "expense_accounts": expense_accounts,
         "net_profit_loss": total_income - total_expense,
     }
+
+
+def compute_balance_sheet(finance_pmc_profile, as_of_date):
+    """Story 3.4: Balance Sheet report aggregation.
+
+    A Balance Sheet is a point-in-time snapshot (spec Design Notes), unlike
+    Trial Balance/P&L's date-range activity -- so both underlying calls use
+    a cumulative window from `finance_pmc_profile.created.date()` (the
+    profile's true inception point, never a hardcoded epoch, spec
+    Boundaries & Constraints/Never) through `as_of_date`, giving genuine
+    running balances for every account, not just recent-period activity.
+
+    If `as_of_date` is before `finance_pmc_profile.created.date()`, the
+    window is empty (start > end) -- `compute_trial_balance` handles this
+    the same as any other window with no Journal Entries: every account
+    comes back zeroed, which is a valid degenerate result, not an error
+    (spec I/O matrix).
+
+    Per-account balance sign follows the same double-entry convention as
+    Story 3.3 (spec Boundaries & Constraints): `Asset` accounts are
+    debit-normal (`total_debit - total_credit`), `Liability` accounts are
+    credit-normal (`total_credit - total_debit`).
+
+    Equity is a single derived "Retained Earnings" line -- never a real
+    posted `Account` row (spec Never) -- computed fresh on every request as
+    `compute_profit_loss`'s cumulative `net_profit_loss` over the same
+    since-inception window (spec Design Notes: this is how any real
+    accounting system would derive Retained Earnings, without a new
+    posting mechanism or touching Epic 2's posting functions).
+
+    Returns a dict: `{"asset_accounts": [...], "liability_accounts": [...],
+    "equity": {"name": "Retained Earnings", "balance": Decimal},
+    "balanced": bool}`, where each account dict has `id`, `name`,
+    `account_type`, `total_debit`, `total_credit`, `balance`.
+    """
+    since_inception = finance_pmc_profile.created.date()
+
+    trial_balance = compute_trial_balance(finance_pmc_profile, since_inception, as_of_date)
+    profit_loss = compute_profit_loss(finance_pmc_profile, since_inception, as_of_date)
+
+    asset_accounts = []
+    liability_accounts = []
+
+    for account in trial_balance["accounts"]:
+        if account["account_type"] == Account.ASSET:
+            balance = account["total_debit"] - account["total_credit"]
+            asset_accounts.append({**account, "balance": balance})
+        elif account["account_type"] == Account.LIABILITY:
+            balance = account["total_credit"] - account["total_debit"]
+            liability_accounts.append({**account, "balance": balance})
+
+    total_assets = sum((row["balance"] for row in asset_accounts), start=0)
+    total_liabilities = sum((row["balance"] for row in liability_accounts), start=0)
+    retained_earnings = profit_loss["net_profit_loss"]
+
+    return {
+        "asset_accounts": asset_accounts,
+        "liability_accounts": liability_accounts,
+        "equity": {
+            "name": "Retained Earnings",
+            "balance": retained_earnings,
+        },
+        "balanced": total_assets == total_liabilities + retained_earnings,
+    }

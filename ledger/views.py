@@ -43,7 +43,7 @@ from ledger.posting import (
     post_rent_ar,
     post_security_deposit,
 )
-from ledger.reports import compute_profit_loss, compute_trial_balance
+from ledger.reports import compute_balance_sheet, compute_profit_loss, compute_trial_balance
 from ledger.response_envelope import prepare_response
 
 
@@ -367,5 +367,90 @@ def profit_loss_report(request):
             "net_profit_loss": profit_loss["net_profit_loss"],
         },
         message="Profit & Loss report generated",
+        status=200,
+    )
+
+
+@api_view(["GET"])
+def balance_sheet_report(request):
+    """Story 3.4: `GET /reports/balance-sheet`.
+
+    `pmc_id` and `as_of_date` are required query params -- exactly one date,
+    no `start_date`/`end_date` pair (spec Boundaries & Constraints: a
+    Balance Sheet is inherently point-in-time). Same auth -> parse/validate
+    -> resolve-profile -> scope-check sequence as Stories 3.2/3.3, adapted
+    for the single date param (no inverted-range check applies -- there's
+    only one date):
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id`/`as_of_date` -- 400 on failure, before any
+         query runs.
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Aggregate via `compute_balance_sheet` (which itself calls
+         `compute_trial_balance`/`compute_profit_loss` with the
+         since-inception window -- never re-derives the aggregation query
+         independently) and respond.
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+    as_of_date_str = request.query_params.get("as_of_date")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    as_of_date = _parse_iso_date(as_of_date_str)
+
+    if pmc_id is None or as_of_date is None:
+        return prepare_response(
+            content={
+                "pmc_id": raw_pmc_id,
+                "as_of_date": as_of_date_str,
+            },
+            message="pmc_id and as_of_date are required "
+            "(as_of_date must be a valid ISO 8601 date)",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view this PMC's reports",
+            status=403,
+        )
+
+    balance_sheet = compute_balance_sheet(finance_pmc_profile, as_of_date)
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "as_of_date": as_of_date.isoformat(),
+            "asset_accounts": balance_sheet["asset_accounts"],
+            "liability_accounts": balance_sheet["liability_accounts"],
+            "equity": balance_sheet["equity"],
+            "balanced": balance_sheet["balanced"],
+        },
+        message="Balance Sheet report generated",
         status=200,
     )
