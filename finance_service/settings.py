@@ -101,3 +101,10 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # (AD-7, Story 2.1b). Sourced from the root .env, already added by Story 2.1a
 # for units-backend's side of the channel; Finance only reads it here.
 FINANCE_INTERNAL_TOKEN = os.getenv("FINANCE_INTERNAL_TOKEN")
+
+# Story 3.1: reporting-endpoint JWT auth. Finance validates the same JWT
+# units-backend issues -- same dedicated JWT_SECRET_KEY/JWT_ALGORITHM env
+# vars (root .env), read the same os.getenv convention as
+# FINANCE_INTERNAL_TOKEN above. Never Django's own SECRET_KEY (AD-17).
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")

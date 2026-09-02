@@ -16,13 +16,16 @@ applied, we create/drop the table ourselves around this test case so the
 command's existence check has something real to query, without ever
 importing units-backend's code (consistent with the spec's Design Notes).
 """
+import jwt
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
+from ledger.auth import authenticate_reporting_request
 from ledger.models import Account, FinancePMCProfile, JournalEntry, LedgerLine
+from ledger.org_scope import get_pmc_ids_for_user_profile
 from ledger.posting import (
     post_bounce_fee,
     post_bounce_reversal,
@@ -529,6 +532,7 @@ class PostRentArTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
                     parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
                     commission_percent NUMERIC(5, 3)
                 )
                 """
@@ -843,6 +847,7 @@ class PostChequeClearingTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
                     parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
                     commission_percent NUMERIC(5, 3)
                 )
                 """
@@ -1208,6 +1213,7 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
                     parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
                     commission_percent NUMERIC(5, 3)
                 )
                 """
@@ -1351,6 +1357,7 @@ class PostBounceReversalTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
                     parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
                     commission_percent NUMERIC(5, 3)
                 )
                 """
@@ -1850,6 +1857,7 @@ class PostBounceFeeTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
                     parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
                     commission_percent NUMERIC(5, 3)
                 )
                 """
@@ -2482,6 +2490,7 @@ class PostSecurityDepositTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
                     parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
                     commission_percent NUMERIC(5, 3)
                 )
                 """
@@ -2818,6 +2827,7 @@ class SyncLeaseEndpointTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
                     parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
                     commission_percent NUMERIC(5, 3)
                 )
                 """
@@ -3013,6 +3023,7 @@ class PostCommissionSplitTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
                     parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
                     commission_percent NUMERIC(5, 3)
                 )
                 """
@@ -3030,6 +3041,7 @@ class PostCommissionSplitTests(TestCase):
                 CREATE TABLE IF NOT EXISTS property_unitowner (
                     id BIGSERIAL PRIMARY KEY,
                     unit_id BIGINT NOT NULL,
+                    owner_id BIGINT,
                     ownership_percent NUMERIC(5, 2) NOT NULL
                 )
                 """
@@ -3439,3 +3451,448 @@ class PostCommissionSplitTests(TestCase):
             ).count(),
             0,
         )
+
+
+class ReportingAuthAndPmcScopingTests(TestCase):
+    """Story 3.1 tests: authenticate_reporting_request + get_pmc_ids_for_user_profile.
+
+    Covers all eight I/O matrix rows from the spec:
+      1. Valid PM token -> helper returns both pmc_ids via PMCPMMapping.
+      2. Valid Owner token, direct path (parent_property) -> resolves pmc_id.
+      3. Valid Owner token, block-tower path (property_block_tower) ->
+         resolves the same pmc_id via the alternate join.
+      4. PM with no PMCPMMapping rows, company_id set -> falls back to
+         [company_id].
+      5. Expired/invalid JWT -> rejected, 401, before any query.
+      6. Token doesn't match UserProfileRef.token -> rejected, 401.
+      7. Inactive user (auth_user.is_active = False) -> rejected, 401.
+      8. Tenant-only profile (no PropertyManager/Owner row) -> helper
+         returns [], not an error.
+
+    Uses the hand-rolled stand-in-table technique (Story 1.2's precedent,
+    extended by every later story) for the unmanaged ref tables this story
+    introduces: user_service_userprofile, user_service_propertymanager,
+    user_service_owner, property_pmcpmmapping, property_unitowner,
+    property_unit, property_property, property_propertyblocks.
+    `AuthUserRef` (`db_table="auth_user"`) is the one exception -- Finance's
+    own `django.contrib.auth` (already in INSTALLED_APPS, needed for Django's
+    test/admin scaffolding) means the real, fully-migrated `auth_user` table
+    already exists in the test database, so this test creates real rows via
+    `django.contrib.auth.models.User` instead of a stand-in table.
+    """
+
+    JWT_SECRET_KEY = "test-jwt-secret"
+    JWT_ALGORITHM = "HS256"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_userprofile (
+                    id BIGSERIAL PRIMARY KEY,
+                    email VARCHAR(255),
+                    token TEXT,
+                    user_id BIGINT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_propertymanager (
+                    userprofile_ptr_id BIGINT PRIMARY KEY,
+                    company_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_owner (
+                    userprofile_ptr_id BIGINT PRIMARY KEY
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_pmcpmmapping (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT NOT NULL,
+                    pm_id BIGINT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unitowner (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT NOT NULL,
+                    owner_id BIGINT,
+                    ownership_percent NUMERIC(5, 2) NOT NULL DEFAULT 100
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_propertyblocks (
+                    id BIGSERIAL PRIMARY KEY,
+                    property_id BIGINT NOT NULL
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            for table in (
+                "property_propertyblocks",
+                "property_property",
+                "property_unit",
+                "property_unitowner",
+                "property_pmcpmmapping",
+                "user_service_owner",
+                "user_service_propertymanager",
+                "user_service_userprofile",
+            ):
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+        super().tearDownClass()
+
+    def setUp(self):
+        from django.contrib.auth.models import User
+
+        User.objects.all().delete()
+        with connection.cursor() as cursor:
+            for table in (
+                "property_propertyblocks",
+                "property_property",
+                "property_unit",
+                "property_unitowner",
+                "property_pmcpmmapping",
+                "user_service_owner",
+                "user_service_propertymanager",
+                "user_service_userprofile",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _make_token(self, email, exp_delta_seconds=3600):
+        import datetime
+
+        payload = {
+            "user_id": 1,
+            "email": email,
+            "exp": datetime.datetime.utcnow()
+            + datetime.timedelta(seconds=exp_delta_seconds),
+        }
+        return jwt.encode(payload, self.JWT_SECRET_KEY, algorithm=self.JWT_ALGORITHM)
+
+    def _make_user_profile(
+        self, cursor, profile_id, email, token, auth_user_id, is_active=True
+    ):
+        from django.contrib.auth.models import User
+
+        User.objects.create(
+            id=auth_user_id,
+            username=f"user{auth_user_id}",
+            email=email or "",
+            is_active=is_active,
+        )
+        cursor.execute(
+            "INSERT INTO user_service_userprofile (id, email, token, user_id) "
+            "VALUES (%s, %s, %s, %s)",
+            [profile_id, email, token, auth_user_id],
+        )
+
+    def _request_with_token(self, token):
+        request = type("FakeRequest", (), {})()
+        request.headers = {"Authorization": f"Bearer {token}"}
+        return request
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_valid_pm_token_returns_both_mapped_pmc_ids(self):
+        token = self._make_token("pm@example.com")
+        with connection.cursor() as cursor:
+            self._make_user_profile(cursor, 1, "pm@example.com", token, 101)
+            cursor.execute(
+                "INSERT INTO user_service_propertymanager (userprofile_ptr_id, company_id) "
+                "VALUES (%s, %s)",
+                [1, 5],
+            )
+            cursor.execute(
+                "INSERT INTO property_pmcpmmapping (pmc_id, pm_id) VALUES (%s, %s)",
+                [10, 1],
+            )
+            cursor.execute(
+                "INSERT INTO property_pmcpmmapping (pmc_id, pm_id) VALUES (%s, %s)",
+                [20, 1],
+            )
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(user_profile_ref)
+
+        pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+        self.assertEqual(sorted(pmc_ids), [10, 20])
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_valid_owner_token_direct_path_resolves_pmc_id(self):
+        token = self._make_token("owner@example.com")
+        with connection.cursor() as cursor:
+            self._make_user_profile(cursor, 2, "owner@example.com", token, 102)
+            cursor.execute("INSERT INTO user_service_owner (userprofile_ptr_id) VALUES (%s)", [2])
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [30, 7],
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [40, 30],
+            )
+            cursor.execute(
+                "INSERT INTO property_unitowner (unit_id, owner_id) VALUES (%s, %s)",
+                [40, 2],
+            )
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(reason)
+
+        pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+        self.assertEqual(pmc_ids, [7])
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_valid_owner_token_block_tower_path_resolves_same_pmc_id(self):
+        token = self._make_token("owner2@example.com")
+        with connection.cursor() as cursor:
+            self._make_user_profile(cursor, 3, "owner2@example.com", token, 103)
+            cursor.execute("INSERT INTO user_service_owner (userprofile_ptr_id) VALUES (%s)", [3])
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [31, 8],
+            )
+            cursor.execute(
+                "INSERT INTO property_propertyblocks (id, property_id) "
+                "VALUES (%s, %s)",
+                [50, 31],
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, property_block_tower_id) "
+                "VALUES (%s, %s)",
+                [41, 50],
+            )
+            cursor.execute(
+                "INSERT INTO property_unitowner (unit_id, owner_id) VALUES (%s, %s)",
+                [41, 3],
+            )
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(reason)
+
+        pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+        self.assertEqual(pmc_ids, [8])
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_pm_with_no_mapping_rows_falls_back_to_company_id(self):
+        token = self._make_token("pm2@example.com")
+        with connection.cursor() as cursor:
+            self._make_user_profile(cursor, 4, "pm2@example.com", token, 104)
+            cursor.execute(
+                "INSERT INTO user_service_propertymanager (userprofile_ptr_id, company_id) "
+                "VALUES (%s, %s)",
+                [4, 99],
+            )
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(reason)
+
+        pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+        self.assertEqual(pmc_ids, [99])
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_pm_with_no_mapping_and_null_company_id_returns_empty_list(self):
+        """A null company_id fallback yields no PMCs, not an error (spec
+        Boundaries & Constraints)."""
+        token = self._make_token("pm3@example.com")
+        with connection.cursor() as cursor:
+            self._make_user_profile(cursor, 5, "pm3@example.com", token, 105)
+            cursor.execute(
+                "INSERT INTO user_service_propertymanager (userprofile_ptr_id, company_id) "
+                "VALUES (%s, %s)",
+                [5, None],
+            )
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(reason)
+
+        pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+        self.assertEqual(pmc_ids, [])
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_expired_jwt_rejected_with_401_before_any_query(self):
+        token = self._make_token("anyone@example.com", exp_delta_seconds=-10)
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(user_profile_ref)
+        self.assertEqual(reason, "expired_token")
+
+    def test_malformed_jwt_rejected_with_401(self):
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token("not-a-real-jwt")
+        )
+        self.assertIsNone(user_profile_ref)
+        self.assertEqual(reason, "invalid_token")
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_stale_token_not_matching_userprofile_token_rejected_with_401(self):
+        """Well-formed, unexpired JWT, but stale -- superseded by a newer
+        login (units-backend's own revocation semantics, spec Design
+        Notes)."""
+        token = self._make_token("stale@example.com")
+        with connection.cursor() as cursor:
+            # UserProfileRef.token is a DIFFERENT (newer) token than the one
+            # presented -- simulates a superseded login.
+            self._make_user_profile(
+                cursor, 6, "stale@example.com", "a-newer-token", 106
+            )
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(user_profile_ref)
+        self.assertEqual(reason, "token_mismatch")
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_inactive_user_rejected_with_401(self):
+        token = self._make_token("inactive@example.com")
+        with connection.cursor() as cursor:
+            self._make_user_profile(
+                cursor,
+                7,
+                "inactive@example.com",
+                token,
+                107,
+                is_active=False,
+            )
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(user_profile_ref)
+        self.assertEqual(reason, "inactive_user")
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_tenant_only_profile_helper_returns_empty_list_not_an_error(self):
+        """A profile with no PropertyManager/Owner row (e.g. Tenant-only) --
+        helper returns [], not an error (spec I/O matrix; Tenant-role
+        scoping is explicitly out of scope, spec Never)."""
+        token = self._make_token("tenant@example.com")
+        with connection.cursor() as cursor:
+            self._make_user_profile(cursor, 8, "tenant@example.com", token, 108)
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(user_profile_ref)
+
+        pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+        self.assertEqual(pmc_ids, [])
+
+    def test_missing_authorization_header_rejected_with_401(self):
+        request = type("FakeRequest", (), {})()
+        request.headers = {}
+
+        user_profile_ref, reason = authenticate_reporting_request(request)
+        self.assertIsNone(user_profile_ref)
+        self.assertEqual(reason, "missing_token")
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_valid_token_but_no_matching_profile_rejected_with_401(self):
+        """A well-formed, unexpired token whose email claim resolves to no
+        UserProfileRef row at all -- rejected, not a 500/crash."""
+        token = self._make_token("nobody@example.com")
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(user_profile_ref)
+        self.assertEqual(reason, "profile_not_found")
+
+    def test_missing_email_claim_rejected_with_401(self):
+        """A token with no email claim at all is rejected outright, never
+        filtered as email=None (which could otherwise match an unrelated
+        profile whose email is also null) -- post-review fix."""
+        payload = {"user_id": 1, "exp": __import__("datetime").datetime.utcnow()
+                   + __import__("datetime").timedelta(seconds=3600)}
+        token = jwt.encode(payload, self.JWT_SECRET_KEY, algorithm=self.JWT_ALGORITHM)
+
+        with override_settings(
+            JWT_SECRET_KEY=self.JWT_SECRET_KEY, JWT_ALGORITHM=self.JWT_ALGORITHM
+        ):
+            user_profile_ref, reason = authenticate_reporting_request(
+                self._request_with_token(token)
+            )
+        self.assertIsNone(user_profile_ref)
+        self.assertEqual(reason, "invalid_token")
+
+    @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
+    def test_diverged_userprofile_email_does_not_leak_wrong_profile(self):
+        """Post-review regression: UserProfileRef.email is a separate,
+        independently-settable field from the related auth_user.email --
+        resolution must go via auth_user.email (matching units-backend's
+        real UserProfile.objects.filter(user__email=...)), never
+        UserProfileRef.email directly. Here the two intentionally diverge;
+        auth must still resolve correctly via the auth_user email."""
+        token = self._make_token("real-login-email@example.com")
+        with connection.cursor() as cursor:
+            from django.contrib.auth.models import User
+
+            User.objects.create(
+                id=109,
+                username="user109",
+                email="real-login-email@example.com",
+                is_active=True,
+            )
+            # UserProfileRef.email deliberately set to a DIFFERENT value
+            # than the auth_user's real email -- simulates the two fields
+            # having diverged.
+            cursor.execute(
+                "INSERT INTO user_service_userprofile (id, email, token, user_id) "
+                "VALUES (%s, %s, %s, %s)",
+                [9, "stale-profile-email@example.com", token, 109],
+            )
+
+        user_profile_ref, reason = authenticate_reporting_request(
+            self._request_with_token(token)
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(user_profile_ref)
+        self.assertEqual(user_profile_ref.id, 9)

@@ -288,12 +288,23 @@ class UnitRef(models.Model):
 
     Story 2.7 adds `commission_percent`: the sole commission source for
     `post_commission_split` (spec Intent -- `Lease.commission` is not read).
+
+    Story 3.1 adds `property_block_tower_id`: the alternate Owner-branch
+    join path (`Unit.property_block_tower` -> `PropertyBlocks.property_id`),
+    alongside the existing `parent_property_id` direct path, matching
+    `org_scope.get_pmc_ids_for_user()`'s real Owner branch exactly.
     """
 
     parent_property_id = models.BigIntegerField(
         null=True,
         blank=True,
         help_text="units-backend Property.id — not a cross-DB FK (next hop toward the PMC).",
+    )
+    property_block_tower_id = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="units-backend PropertyBlocks.id — not a cross-DB FK; the "
+        "alternate Owner-branch join path to a Unit's PMC (Story 3.1).",
     )
     commission_percent = models.DecimalField(
         max_digits=5,
@@ -321,10 +332,21 @@ class UnitOwnerRef(models.Model):
     above. Field list is kept minimal -- only what
     `post_commission_split`'s sum-to-100 validation actually needs (spec
     Code Map).
+
+    Story 3.1 adds `owner_id`: joins back to `OwnerRef` for the PMC-scoping
+    helper's Owner branch (`get_pmc_ids_for_user_profile`) -- Epic 2 only
+    needed `unit_id`/`ownership_percent` to validate the sum-to-100
+    invariant, never to identify which owner a row belongs to.
     """
 
     unit_id = models.BigIntegerField(
         help_text="units-backend Unit.id — not a cross-DB FK (AD-19 precedent)."
+    )
+    owner_id = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="units-backend Owner.id (UnitOwner.owner_id) — not a "
+        "cross-DB FK; joins back to OwnerRef for PMC-scoping (Story 3.1).",
     )
     ownership_percent = models.DecimalField(
         max_digits=5,
@@ -362,3 +384,189 @@ class PropertyRef(models.Model):
 
     def __str__(self):
         return f"PropertyRef(id={self.id}, pmc_id={self.pmc_id})"
+
+
+class UserProfileRef(models.Model):
+    """Read-only reference onto units-backend's UserProfile table (Story 3.1).
+
+    Resolved by the JWT's `email` claim (units-backend's real mechanism,
+    human-confirmed -- NOT `user_id`, per `utilities/decorator.py`'s
+    `UserProfile.objects.filter(user__email=user_email)`). Also carries
+    `token` for the DB-backed single-token revocation check
+    (`user_profile.token == token`) and `user_id` (the underlying
+    `auth_user.id`, Django's `User` model) so `authenticate_reporting_request`
+    can check `auth_user.is_active` via a second, minimal lookup without a
+    cross-app Django FK (Finance never imports units-backend's `User`/
+    `user_service` code).
+
+    `id` (the implicit PK) is `UserProfile.id` -- the same PK value
+    `PropertyManagerRef`/`OwnerRef` share via Django multi-table inheritance
+    in the real schema (units-backend's `PropertyManager`/`Owner` are
+    `UserProfile` subclasses; their tables' PK IS `UserProfile.id`, exposed as
+    `userprofile_ptr_id`). Finance's unmanaged refs are separate models (no
+    inheritance across apps), so `get_pmc_ids_for_user_profile` looks up
+    `PropertyManagerRef`/`OwnerRef` by `pk=user_profile_ref.id` directly.
+    """
+
+    email = models.EmailField(max_length=255, null=True, blank=True)
+    token = models.TextField(null=True, blank=True)
+    user_id = models.BigIntegerField(
+        help_text="units-backend auth_user.id (Django's User model) — the "
+        "FK column backing UserProfile.user_id; not a cross-DB FK."
+    )
+
+    class Meta:
+        managed = False
+        db_table = "user_service_userprofile"
+
+    def __str__(self):
+        return f"UserProfileRef(id={self.id}, email={self.email})"
+
+
+class AuthUserRef(models.Model):
+    """Read-only reference onto Django's own `auth_user` table (Story 3.1).
+
+    Lets `authenticate_reporting_request` check `is_active` (matching
+    units-backend's `user_profile.user.is_active` check) without importing
+    units-backend's Django `User`/settings, by reading the same underlying
+    table Django's default auth app always creates as `auth_user`, keyed by
+    `UserProfileRef.user_id`.
+
+    Post-review fix: also carries `email` -- units-backend's real profile
+    lookup resolves via `UserProfile.objects.filter(user__email=...)`, i.e.
+    the related `User.email`, NOT `UserProfile.email` (a separate,
+    independently-settable field on `UserProfile` itself). Filtering
+    directly on `UserProfileRef.email` would silently authenticate the
+    wrong profile if the two ever diverge for a given user -- confirmed a
+    real bug, not a stylistic difference, by direct comparison against
+    `utilities/decorator.py`.
+    """
+
+    email = models.EmailField(max_length=255, null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        managed = False
+        db_table = "auth_user"
+
+    def __str__(self):
+        return f"AuthUserRef(id={self.id}, is_active={self.is_active})"
+
+
+class PropertyManagerRef(models.Model):
+    """Read-only reference onto units-backend's PropertyManager table (Story 3.1).
+
+    Multi-table inheritance in the real schema means this table's PK
+    column is `userprofile_ptr_id` (Django's auto-derived parent-link
+    column name), holding the same value as the owning `UserProfile.id` --
+    so Finance looks this up by `pk=user_profile_ref.id`, matching
+    `org_scope.get_pmc_ids_for_user()`'s own
+    `PropertyManager.objects.filter(pk=user_profile.pk)` exactly.
+
+    Post-review fix: `pk` is declared explicitly with
+    `db_column="userprofile_ptr_id"` -- without this, Django's implicit
+    `id` PK would generate SQL against a column that doesn't exist on the
+    real table (confirmed: `user_service_propertymanager`'s only PK column
+    is `userprofile_ptr_id`, no `id` column exists), causing every query
+    to fail with an undefined-column error.
+    """
+
+    userprofile_ptr_id = models.BigIntegerField(
+        primary_key=True,
+        db_column="userprofile_ptr_id",
+        help_text="units-backend UserProfile.id, via PropertyManager's "
+        "multi-table-inheritance parent link (userprofile_ptr_id) — not a "
+        "cross-DB FK.",
+    )
+    company_id = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="units-backend PropertyManagmentCompany.id "
+        "(PropertyManager.company_id) — the PMCPMMapping fallback "
+        "(AD-19 precedent); may be null.",
+    )
+
+    class Meta:
+        managed = False
+        db_table = "user_service_propertymanager"
+
+    def __str__(self):
+        return f"PropertyManagerRef(id={self.pk}, company_id={self.company_id})"
+
+
+class OwnerRef(models.Model):
+    """Read-only reference onto units-backend's Owner table (Story 3.1).
+
+    No extra fields needed beyond the pk (spec Code Map) -- its real
+    schema PK column is `userprofile_ptr_id` (multi-table inheritance),
+    holding the same value as the owning `UserProfile.id`, so Finance
+    looks this up by `pk=user_profile_ref.id`, matching
+    `org_scope.get_pmc_ids_for_user()`'s own
+    `Owner.objects.filter(pk=user_profile.pk)` exactly. Existence alone
+    (a matching row) is what the PMC-scoping helper's Owner branch checks.
+
+    Post-review fix: `pk` is declared explicitly with
+    `db_column="userprofile_ptr_id"` -- same reasoning as `PropertyManagerRef`
+    (the real table has no `id` column, only `userprofile_ptr_id`).
+    """
+
+    userprofile_ptr_id = models.BigIntegerField(
+        primary_key=True,
+        db_column="userprofile_ptr_id",
+        help_text="units-backend UserProfile.id, via Owner's "
+        "multi-table-inheritance parent link (userprofile_ptr_id) — not a "
+        "cross-DB FK.",
+    )
+
+    class Meta:
+        managed = False
+        db_table = "user_service_owner"
+
+    def __str__(self):
+        return f"OwnerRef(id={self.pk})"
+
+
+class PMCPMMappingRef(models.Model):
+    """Read-only reference onto units-backend's PMCPMMapping table (Story 3.1).
+
+    Resolves a PropertyManager's mapped pmc_ids -- the PropertyManager
+    branch's primary path (before the `company_id` fallback), matching
+    `org_scope.get_pmc_ids_for_user()`'s own
+    `PMCPMMapping.objects.filter(pm=pm)` exactly.
+    """
+
+    pmc_id = models.BigIntegerField(
+        help_text="units-backend PropertyManagmentCompany.id (PMCPMMapping.pmc_id) — not a cross-DB FK."
+    )
+    pm_id = models.BigIntegerField(
+        help_text="units-backend PropertyManager.id (PMCPMMapping.pm_id) — not a cross-DB FK."
+    )
+
+    class Meta:
+        managed = False
+        db_table = "property_pmcpmmapping"
+
+    def __str__(self):
+        return f"PMCPMMappingRef(id={self.id}, pmc_id={self.pmc_id}, pm_id={self.pm_id})"
+
+
+class PropertyBlocksRef(models.Model):
+    """Read-only reference onto units-backend's PropertyBlocks table (Story 3.1).
+
+    The alternate Owner-branch join path's second hop:
+    `UnitRef.property_block_tower_id` -> `PropertyBlocksRef.property_id` ->
+    `PropertyRef.pmc_id`, matching
+    `org_scope.get_pmc_ids_for_user()`'s own
+    `property_blocks__block_towers__unit_owners__owner` traversal.
+    """
+
+    property_id = models.BigIntegerField(
+        help_text="units-backend Property.id (PropertyBlocks.property_id) — not a cross-DB FK."
+    )
+
+    class Meta:
+        managed = False
+        db_table = "property_propertyblocks"
+
+    def __str__(self):
+        return f"PropertyBlocksRef(id={self.id}, property_id={self.property_id})"
