@@ -2,7 +2,7 @@
 from django.contrib import admin
 from django.urls import path
 
-from ledger.views import sync_lease, sync_lease_transaction
+from ledger.views import sync_lease, sync_lease_transaction, trial_balance_report
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -35,5 +35,18 @@ urlpatterns = [
         'internal/leases/<int:lease_id>/sync',
         sync_lease,
         name='sync-lease-no-slash',
+    ),
+    # Story 3.2: Trial Balance report -- trailing-slash + no-slash pair,
+    # matching the existing /internal/... route-pair precedent above (spec
+    # Boundaries & Constraints).
+    path(
+        'reports/trial-balance/',
+        trial_balance_report,
+        name='trial-balance-report',
+    ),
+    path(
+        'reports/trial-balance',
+        trial_balance_report,
+        name='trial-balance-report-no-slash',
     ),
 ]

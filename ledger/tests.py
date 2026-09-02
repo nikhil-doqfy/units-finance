@@ -3896,3 +3896,474 @@ class ReportingAuthAndPmcScopingTests(TestCase):
         self.assertIsNone(reason)
         self.assertIsNotNone(user_profile_ref)
         self.assertEqual(user_profile_ref.id, 9)
+
+
+@override_settings(
+    JWT_SECRET_KEY="test-jwt-secret-3-2", JWT_ALGORITHM="HS256"
+)
+class TrialBalanceReportTests(TestCase):
+    """Story 3.2 tests: GET /reports/trial-balance.
+
+    Covers all seven I/O matrix rows from the spec:
+      1. Happy path -- every Account's total debit/credit, balanced: true.
+      2. Zero-activity account included with total_debit=0, total_credit=0.
+      3. Reversal entry summed unconditionally (no special-casing, AD-16).
+      4. Unreachable pmc_id -- 403.
+      5. Nonexistent pmc_id -- 404.
+      6. Invalid/missing date range -- 400, before any query.
+      7. Unauthenticated/expired/revoked token -- 401, before any query.
+
+    Reuses ReportingAuthAndPmcScopingTests' stand-in-table technique for the
+    unmanaged units-backend ref tables (user_service_userprofile,
+    user_service_owner, property_property, property_unit,
+    property_unitowner) needed to exercise the Owner branch of
+    get_pmc_ids_for_user_profile through the real HTTP view.
+    """
+
+    JWT_SECRET_KEY = "test-jwt-secret-3-2"
+    JWT_ALGORITHM = "HS256"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_userprofile (
+                    id BIGSERIAL PRIMARY KEY,
+                    email VARCHAR(255),
+                    token TEXT,
+                    user_id BIGINT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_owner (
+                    userprofile_ptr_id BIGINT PRIMARY KEY
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_propertymanager (
+                    userprofile_ptr_id BIGINT PRIMARY KEY,
+                    company_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_pmcpmmapping (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT NOT NULL,
+                    pm_id BIGINT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unitowner (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT NOT NULL,
+                    owner_id BIGINT,
+                    ownership_percent NUMERIC(5, 2) NOT NULL DEFAULT 100
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            for table in (
+                "property_unitowner",
+                "property_unit",
+                "property_property",
+                "property_pmcpmmapping",
+                "user_service_propertymanager",
+                "user_service_owner",
+                "user_service_userprofile",
+            ):
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+        super().tearDownClass()
+
+    def setUp(self):
+        from django.contrib.auth.models import User
+
+        User.objects.all().delete()
+        with connection.cursor() as cursor:
+            for table in (
+                "property_unitowner",
+                "property_unit",
+                "property_property",
+                "property_pmcpmmapping",
+                "user_service_propertymanager",
+                "user_service_owner",
+                "user_service_userprofile",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _make_token(self, email, exp_delta_seconds=3600):
+        import datetime as dt
+
+        payload = {
+            "user_id": 1,
+            "email": email,
+            "exp": dt.datetime.utcnow() + dt.timedelta(seconds=exp_delta_seconds),
+        }
+        return jwt.encode(payload, self.JWT_SECRET_KEY, algorithm=self.JWT_ALGORITHM)
+
+    def _make_owner_with_pmc(
+        self, profile_id, email, token, auth_user_id, unit_id, property_id, pmc_id
+    ):
+        from django.contrib.auth.models import User
+
+        User.objects.create(
+            id=auth_user_id,
+            username=f"owner{auth_user_id}",
+            email=email,
+            is_active=True,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO user_service_userprofile (id, email, token, user_id) "
+                "VALUES (%s, %s, %s, %s)",
+                [profile_id, email, token, auth_user_id],
+            )
+            cursor.execute(
+                "INSERT INTO user_service_owner (userprofile_ptr_id) VALUES (%s)",
+                [profile_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [property_id, pmc_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [unit_id, property_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_unitowner (unit_id, owner_id) VALUES (%s, %s)",
+                [unit_id, profile_id],
+            )
+
+    def _make_profile(self, pmc_id):
+        return FinancePMCProfile.objects.create(
+            pmc_id=pmc_id,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+    def _post_journal_entry(
+        self,
+        profile,
+        transition,
+        lines,
+        posted_at=None,
+        source_txn_id=1,
+        reversed_journal_entry=None,
+    ):
+        """lines: list of (account_name, debit, credit) tuples."""
+        entry = JournalEntry.objects.create(
+            finance_pmc_profile=profile,
+            source_lease_transaction_id=source_txn_id,
+            source_status_transition=transition,
+            reversed_journal_entry=reversed_journal_entry,
+        )
+        if posted_at is not None:
+            JournalEntry.objects.filter(pk=entry.pk).update(posted_at=posted_at)
+            entry.refresh_from_db()
+        for account_name, debit, credit in lines:
+            account = Account.objects.get(
+                finance_pmc_profile=profile, name=account_name
+            )
+            LedgerLine.objects.create(
+                journal_entry=entry, account=account, debit=debit, credit=credit
+            )
+        return entry
+
+    def _url(self):
+        return reverse("trial-balance-report")
+
+    def test_happy_path_returns_every_account_balanced_true(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=1)
+        token = self._make_token("owner@example.com")
+        self._make_owner_with_pmc(
+            1, "owner@example.com", token, 201, unit_id=10, property_id=20, pmc_id=1
+        )
+
+        posted_at = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+        self._post_journal_entry(
+            profile,
+            "CREATE-BALANCE",
+            [("AR — Tenants", 5000, 0), ("Rent Income", 0, 5000)],
+            posted_at=posted_at,
+            source_txn_id=100,
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 1, "start_date": "2026-06-01", "end_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], 200)
+        self.assertTrue(body["content"]["balanced"])
+
+        accounts = {a["name"]: a for a in body["content"]["accounts"]}
+        self.assertEqual(
+            set(accounts.keys()),
+            {
+                "Rent Income",
+                "Security Deposits Held",
+                "VAT Payable",
+                "Bank",
+                "AR — Tenants",
+                "AP — PMC Commission",
+                "Commission Expense",
+                "Bank Charges/Fees",
+                "Bounced Cheques",
+            },
+        )
+        self.assertEqual(accounts["AR — Tenants"]["total_debit"], 5000.0)
+        self.assertEqual(accounts["AR — Tenants"]["total_credit"], 0.0)
+        self.assertEqual(accounts["Rent Income"]["total_debit"], 0.0)
+        self.assertEqual(accounts["Rent Income"]["total_credit"], 5000.0)
+
+        sum_debit = sum(float(a["total_debit"]) for a in accounts.values())
+        sum_credit = sum(float(a["total_credit"]) for a in accounts.values())
+        self.assertEqual(sum_debit, sum_credit)
+
+    def test_zero_activity_account_included_with_zero_totals(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=2)
+        token = self._make_token("owner2@example.com")
+        self._make_owner_with_pmc(
+            2, "owner2@example.com", token, 202, unit_id=11, property_id=21, pmc_id=2
+        )
+
+        posted_at = dt.datetime(2026, 6, 10, tzinfo=dt.timezone.utc)
+        self._post_journal_entry(
+            profile,
+            "CREATE-BALANCE",
+            [("AR — Tenants", 1000, 0), ("Rent Income", 0, 1000)],
+            posted_at=posted_at,
+            source_txn_id=101,
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 2, "start_date": "2026-06-01", "end_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        accounts = {a["name"]: a for a in response.json()["content"]["accounts"]}
+        # "Bank" had no activity in the period -- still present, zeroed.
+        self.assertEqual(accounts["Bank"]["total_debit"], 0.0)
+        self.assertEqual(accounts["Bank"]["total_credit"], 0.0)
+
+    def test_reversal_entry_summed_unconditionally(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=3)
+        token = self._make_token("owner3@example.com")
+        self._make_owner_with_pmc(
+            3, "owner3@example.com", token, 203, unit_id=12, property_id=22, pmc_id=3
+        )
+
+        posted_at = dt.datetime(2026, 6, 5, tzinfo=dt.timezone.utc)
+        original = self._post_journal_entry(
+            profile,
+            "CREATE-BALANCE",
+            [("AR — Tenants", 2000, 0), ("Rent Income", 0, 2000)],
+            posted_at=posted_at,
+            source_txn_id=102,
+        )
+        self._post_journal_entry(
+            profile,
+            "BALANCE-BOUNCED",
+            [("AR — Tenants", 0, 2000), ("Bounced Cheques", 2000, 0)],
+            posted_at=posted_at,
+            source_txn_id=102,
+            reversed_journal_entry=original,
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 3, "start_date": "2026-06-01", "end_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["content"]["balanced"])
+        accounts = {a["name"]: a for a in body["content"]["accounts"]}
+        # AR — Tenants: debited 2000 (rent), credited 2000 (reversal) -- both
+        # summed, no special-casing.
+        self.assertEqual(accounts["AR — Tenants"]["total_debit"], 2000.0)
+        self.assertEqual(accounts["AR — Tenants"]["total_credit"], 2000.0)
+        self.assertEqual(accounts["Bounced Cheques"]["total_debit"], 2000.0)
+        self.assertEqual(accounts["Rent Income"]["total_credit"], 2000.0)
+
+    def test_unreachable_pmc_id_rejected_with_403(self):
+        self._make_profile(pmc_id=4)
+        # Owner is scoped to pmc_id=5, not pmc_id=4.
+        token = self._make_token("owner4@example.com")
+        self._make_owner_with_pmc(
+            4, "owner4@example.com", token, 204, unit_id=13, property_id=23, pmc_id=5
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 4, "start_date": "2026-06-01", "end_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["status"], 403)
+
+    def test_nonexistent_pmc_id_rejected_with_404(self):
+        token = self._make_token("owner5@example.com")
+        self._make_owner_with_pmc(
+            5, "owner5@example.com", token, 205, unit_id=14, property_id=24, pmc_id=999
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 999, "start_date": "2026-06-01", "end_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["status"], 404)
+
+    def test_missing_date_range_rejected_with_400(self):
+        self._make_profile(pmc_id=6)
+        token = self._make_token("owner6@example.com")
+        self._make_owner_with_pmc(
+            6, "owner6@example.com", token, 206, unit_id=15, property_id=25, pmc_id=6
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 6},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile__pmc_id=6).count(), 0
+        )
+
+    def test_invalid_date_format_rejected_with_400(self):
+        self._make_profile(pmc_id=7)
+        token = self._make_token("owner7@example.com")
+        self._make_owner_with_pmc(
+            7, "owner7@example.com", token, 207, unit_id=16, property_id=26, pmc_id=7
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 7, "start_date": "not-a-date", "end_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_inverted_date_range_rejected_with_400(self):
+        """Post-review patch: start_date after end_date is rejected outright
+        rather than silently running a query that always returns
+        zero-activity accounts."""
+        self._make_profile(pmc_id=71)
+        token = self._make_token("owner71@example.com")
+        self._make_owner_with_pmc(
+            71, "owner71@example.com", token, 271, unit_id=161, property_id=261, pmc_id=71
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 71, "start_date": "2026-06-30", "end_date": "2026-06-01"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_unauthenticated_request_rejected_with_401_before_any_query(self):
+        self._make_profile(pmc_id=8)
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 8, "start_date": "2026-06-01", "end_date": "2026-06-30"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["status"], 401)
+
+    def test_expired_token_rejected_with_401(self):
+        token = self._make_token("owner9@example.com", exp_delta_seconds=-10)
+        self._make_profile(pmc_id=9)
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 9, "start_date": "2026-06-01", "end_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_no_trailing_slash_url_also_works(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=10)
+        token = self._make_token("owner10@example.com")
+        self._make_owner_with_pmc(
+            10,
+            "owner10@example.com",
+            token,
+            210,
+            unit_id=17,
+            property_id=27,
+            pmc_id=10,
+        )
+        posted_at = dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc)
+        self._post_journal_entry(
+            profile,
+            "CREATE-BALANCE",
+            [("AR — Tenants", 100, 0), ("Rent Income", 0, 100)],
+            posted_at=posted_at,
+            source_txn_id=110,
+        )
+
+        response = self.client.get(
+            reverse("trial-balance-report-no-slash"),
+            {"pmc_id": 10, "start_date": "2026-06-01", "end_date": "2026-06-30"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["content"]["balanced"])

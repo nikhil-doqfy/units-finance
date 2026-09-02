@@ -26,9 +26,14 @@ result is `{"posted": True}` (spec Boundaries & Constraints). Unlike
 Story 2.3-2.5's checks, this is not run unconditionally on every sync: it
 piggybacks entirely on a successful rent AR post in the same call.
 """
+import datetime
+
 from rest_framework.decorators import api_view
 
+from ledger.auth import authenticate_reporting_request
 from ledger.decorators import require_internal_token
+from ledger.models import FinancePMCProfile, LeaseRef, LeaseTransactionRef
+from ledger.org_scope import get_pmc_ids_for_user_profile
 from ledger.posting import (
     RENT_CHEQUE,
     post_bounce_fee,
@@ -38,7 +43,7 @@ from ledger.posting import (
     post_rent_ar,
     post_security_deposit,
 )
-from ledger.models import LeaseRef, LeaseTransactionRef
+from ledger.reports import compute_trial_balance
 from ledger.response_envelope import prepare_response
 
 
@@ -163,5 +168,110 @@ def sync_lease(request, lease_id):
             **({"posting": posting_results} if posting_results else {}),
         },
         message="Lease sync acknowledged",
+        status=200,
+    )
+
+
+def _parse_iso_date(value):
+    """Parse an ISO 8601 date string (YYYY-MM-DD); returns None if missing
+    or unparseable (spec: invalid/missing date range -> 400, before any
+    query runs)."""
+    if not value:
+        return None
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+@api_view(["GET"])
+def trial_balance_report(request):
+    """Story 3.2: `GET /reports/trial-balance`.
+
+    `pmc_id`, `start_date`, `end_date` are required query params.
+    Ordering, per spec Boundaries & Constraints:
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id`/`start_date`/`end_date` -- 400 on failure,
+         before any query runs.
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Aggregate via `compute_trial_balance` and respond.
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+    start_date_str = request.query_params.get("start_date")
+    end_date_str = request.query_params.get("end_date")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    start_date = _parse_iso_date(start_date_str)
+    end_date = _parse_iso_date(end_date_str)
+
+    if pmc_id is None or start_date is None or end_date is None:
+        return prepare_response(
+            content={
+                "pmc_id": raw_pmc_id,
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+            },
+            message="pmc_id, start_date, and end_date are required "
+            "(start_date/end_date must be valid ISO 8601 dates)",
+            status=400,
+        )
+
+    if start_date > end_date:
+        # Post-review patch: an inverted range (start after end) would
+        # otherwise silently run a query that always returns zero-activity
+        # accounts rather than surfacing the caller's mistake.
+        return prepare_response(
+            content={
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+            },
+            message="start_date must not be after end_date",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view this PMC's reports",
+            status=403,
+        )
+
+    trial_balance = compute_trial_balance(finance_pmc_profile, start_date, end_date)
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "accounts": trial_balance["accounts"],
+            "balanced": trial_balance["balanced"],
+        },
+        message="Trial Balance report generated",
         status=200,
     )
