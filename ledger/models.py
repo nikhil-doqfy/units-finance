@@ -221,6 +221,66 @@ class BankStatementLine(models.Model):
         )
 
 
+class BankStatementMatch(models.Model):
+    """Join row recording one reconciliation decision between a
+    `BankStatementLine` and a Bank Journal `JournalEntry` (Story 4.2, FR-15).
+
+    A real Django model with real FKs on both sides -- both
+    `BankStatementLine` and `JournalEntry` are Finance-owned models living in
+    this same app/database, following the `Account`/`JournalEntry` FK
+    convention (spec Boundaries & Constraints; never a plain
+    `BigIntegerField`, that pattern is reserved for units-backend mirrors,
+    AD-19).
+
+    Chosen over adding fields directly to `JournalEntry`/`LedgerLine`
+    (human-confirmed, spec Never): a rejected suggestion needs somewhere to
+    persist without touching either Ledger model, and both sides must stay
+    free for a later, different match. `status` models the row's lifecycle
+    (`suggested` -> `confirmed`, or `suggested` -> `rejected` -> `confirmed`
+    if re-tried) as a mutable field on one row, rather than multiple rows
+    per pair (spec Design Notes).
+    """
+
+    SUGGESTED = "suggested"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+
+    STATUS_CHOICES = [
+        (SUGGESTED, "Suggested"),
+        (CONFIRMED, "Confirmed"),
+        (REJECTED, "Rejected"),
+    ]
+
+    bank_statement_line = models.ForeignKey(
+        BankStatementLine,
+        on_delete=models.CASCADE,
+        related_name="matches",
+    )
+    journal_entry = models.ForeignKey(
+        JournalEntry,
+        on_delete=models.CASCADE,
+        related_name="statement_matches",
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    created = models.DateTimeField(auto_now_add=True)
+    modified = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        # Post-review patch: `_confirm_match`/`_reject_match` already assume
+        # at most one row exists per (bank_statement_line, journal_entry)
+        # pair -- they look one up and update it in place rather than ever
+        # creating a second row for the same pair. This constraint enforces
+        # that assumption at the database level instead of relying solely on
+        # application-level check-then-act logic.
+        unique_together = [("bank_statement_line", "journal_entry")]
+
+    def __str__(self):
+        return (
+            f"BankStatementMatch(bank_statement_line_id={self.bank_statement_line_id}, "
+            f"journal_entry_id={self.journal_entry_id}, status={self.status})"
+        )
+
+
 class LeaseTransactionRef(models.Model):
     """Read-only reference onto units-backend's LeaseTransaction table.
 

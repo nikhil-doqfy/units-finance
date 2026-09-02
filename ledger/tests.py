@@ -31,6 +31,7 @@ from ledger.auth import authenticate_reporting_request
 from ledger.models import (
     Account,
     BankStatementLine,
+    BankStatementMatch,
     FinancePMCProfile,
     JournalEntry,
     LedgerLine,
@@ -6214,3 +6215,1003 @@ class BankStatementImportTests(TestCase):
         self.assertEqual(
             BankStatementLine.objects.filter(finance_pmc_profile=profile).count(), 1
         )
+
+
+@override_settings(
+    JWT_SECRET_KEY="test-jwt-secret-4-2", JWT_ALGORITHM="HS256"
+)
+class BankStatementMatchTests(TestCase):
+    """Story 4.2 tests: GET /reconciliation/suggested-matches and
+    POST /reconciliation/match.
+
+    Reuses `BankStatementImportTests`'s stand-in-table fixture pattern
+    (`_make_profile`, `_make_token`, `_make_owner_with_pmc`) plus
+    `TrialBalanceReportTests._post_journal_entry` for creating Bank Journal
+    fixture entries (spec Code Map).
+
+    Covers every I/O Matrix row from the spec:
+      1. Suggestions happy path -- one suggestion returned.
+      2. Suggestions: no candidates -- empty list.
+      3. Suggestions: date outside window -- excluded.
+      4. Confirm happy path -- both sides reconciled.
+      5. Confirm: statement line already reconciled -- 409.
+      6. Confirm: journal entry already matched elsewhere -- 409.
+      7. Confirm: manual pairing outside suggestions -- 200, accepted.
+      8. Reject happy path -- neither side reconciled.
+      9. Reject then re-confirm same pair -- 200, transitions to confirmed.
+      10. Re-confirm already-confirmed same pair -- 200, idempotent.
+      11. Unknown ids -- 404.
+      12. Invalid action -- 400.
+    Plus auth/scope (401/403) and no-trailing-slash URL variants.
+    """
+
+    JWT_SECRET_KEY = "test-jwt-secret-4-2"
+    JWT_ALGORITHM = "HS256"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_userprofile (
+                    id BIGSERIAL PRIMARY KEY,
+                    email VARCHAR(255),
+                    token TEXT,
+                    user_id BIGINT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_owner (
+                    userprofile_ptr_id BIGINT PRIMARY KEY
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_propertymanager (
+                    userprofile_ptr_id BIGINT PRIMARY KEY,
+                    company_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_pmcpmmapping (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT NOT NULL,
+                    pm_id BIGINT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unitowner (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT NOT NULL,
+                    owner_id BIGINT,
+                    ownership_percent NUMERIC(5, 2) NOT NULL DEFAULT 100
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            for table in (
+                "property_unitowner",
+                "property_unit",
+                "property_property",
+                "property_pmcpmmapping",
+                "user_service_propertymanager",
+                "user_service_owner",
+                "user_service_userprofile",
+            ):
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+        super().tearDownClass()
+
+    def setUp(self):
+        from django.contrib.auth.models import User
+
+        User.objects.all().delete()
+        with connection.cursor() as cursor:
+            for table in (
+                "property_unitowner",
+                "property_unit",
+                "property_property",
+                "property_pmcpmmapping",
+                "user_service_propertymanager",
+                "user_service_owner",
+                "user_service_userprofile",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _suggested_matches_url(self):
+        return reverse("suggested-matches")
+
+    def _match_url(self):
+        return reverse("apply-bank-statement-match")
+
+    def _make_token(self, email, exp_delta_seconds=3600):
+        import datetime as dt
+
+        payload = {
+            "user_id": 1,
+            "email": email,
+            "exp": dt.datetime.utcnow() + dt.timedelta(seconds=exp_delta_seconds),
+        }
+        return jwt.encode(payload, self.JWT_SECRET_KEY, algorithm=self.JWT_ALGORITHM)
+
+    def _make_owner_with_pmc(
+        self, profile_id, email, token, auth_user_id, unit_id, property_id, pmc_id
+    ):
+        from django.contrib.auth.models import User
+
+        User.objects.create(
+            id=auth_user_id,
+            username=f"owner{auth_user_id}",
+            email=email,
+            is_active=True,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO user_service_userprofile (id, email, token, user_id) "
+                "VALUES (%s, %s, %s, %s)",
+                [profile_id, email, token, auth_user_id],
+            )
+            cursor.execute(
+                "INSERT INTO user_service_owner (userprofile_ptr_id) VALUES (%s)",
+                [profile_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [property_id, pmc_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [unit_id, property_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_unitowner (unit_id, owner_id) VALUES (%s, %s)",
+                [unit_id, profile_id],
+            )
+
+    def _make_profile(self, pmc_id):
+        return FinancePMCProfile.objects.create(
+            pmc_id=pmc_id,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+    def _post_journal_entry(
+        self,
+        profile,
+        transition,
+        lines,
+        posted_at=None,
+        source_txn_id=1,
+    ):
+        """lines: list of (account_name, debit, credit) tuples. Mirrors
+        TrialBalanceReportTests._post_journal_entry (spec Code Map)."""
+        entry = JournalEntry.objects.create(
+            finance_pmc_profile=profile,
+            source_lease_transaction_id=source_txn_id,
+            source_status_transition=transition,
+        )
+        if posted_at is not None:
+            JournalEntry.objects.filter(pk=entry.pk).update(posted_at=posted_at)
+            entry.refresh_from_db()
+        for account_name, debit, credit in lines:
+            account = Account.objects.get(
+                finance_pmc_profile=profile, name=account_name
+            )
+            LedgerLine.objects.create(
+                journal_entry=entry, account=account, debit=debit, credit=credit
+            )
+        return entry
+
+    def _make_bank_journal_entry(self, profile, amount, posted_at, source_txn_id):
+        """A Bank Journal entry matching post_cheque_clearing's posting
+        shape: debit Bank, credit AR — Tenants (spec Boundaries &
+        Constraints)."""
+        return self._post_journal_entry(
+            profile,
+            "CREDITED-REALIZED",
+            [("Bank", amount, 0), ("AR — Tenants", 0, amount)],
+            posted_at=posted_at,
+            source_txn_id=source_txn_id,
+        )
+
+    def _make_statement_line(self, profile, statement_date, amount, reference):
+        return BankStatementLine.objects.create(
+            finance_pmc_profile=profile,
+            statement_date=statement_date,
+            amount=decimal.Decimal(str(amount)),
+            reference=reference,
+        )
+
+    # -- Suggestions --------------------------------------------------
+
+    def test_suggestions_happy_path_returns_one_match(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=501)
+        token = self._make_token("matchowner501@example.com")
+        self._make_owner_with_pmc(
+            501, "matchowner501@example.com", token, 701, unit_id=8010, property_id=9010, pmc_id=501
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile,
+            500,
+            dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc),
+            source_txn_id=901,
+        )
+
+        response = self.client.get(
+            self._suggested_matches_url(),
+            {"pmc_id": 501},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        suggestions = response.json()["content"]["suggestions"]
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0]["bank_statement_line_id"], line.id)
+        self.assertEqual(suggestions[0]["journal_entry_id"], entry.id)
+
+    def test_suggestions_no_candidates_returns_empty_list(self):
+        profile = self._make_profile(pmc_id=502)
+        token = self._make_token("matchowner502@example.com")
+        self._make_owner_with_pmc(
+            502, "matchowner502@example.com", token, 702, unit_id=8020, property_id=9020, pmc_id=502
+        )
+        self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+
+        response = self.client.get(
+            self._suggested_matches_url(),
+            {"pmc_id": 502},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"]["suggestions"], [])
+
+    def test_suggestions_date_outside_window_excluded(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=503)
+        token = self._make_token("matchowner503@example.com")
+        self._make_owner_with_pmc(
+            503, "matchowner503@example.com", token, 703, unit_id=8030, property_id=9030, pmc_id=503
+        )
+        self._make_statement_line(
+            profile, datetime.date(2026, 6, 1), "500.00", "REF-1"
+        )
+        self._make_bank_journal_entry(
+            profile,
+            500,
+            dt.datetime(2026, 6, 9, tzinfo=dt.timezone.utc),  # 8 days apart
+            source_txn_id=902,
+        )
+
+        response = self.client.get(
+            self._suggested_matches_url(),
+            {"pmc_id": 503},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"]["suggestions"], [])
+
+    def test_confirmed_pair_excluded_from_later_suggestions(self):
+        """Acceptance Criteria: a confirmed match's line/entry no longer
+        appear in the suggestions list."""
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=504)
+        token = self._make_token("matchowner504@example.com")
+        self._make_owner_with_pmc(
+            504, "matchowner504@example.com", token, 704, unit_id=8040, property_id=9040, pmc_id=504
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile,
+            500,
+            dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc),
+            source_txn_id=903,
+        )
+
+        confirm_response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 504,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(confirm_response.status_code, 200)
+
+        response = self.client.get(
+            self._suggested_matches_url(),
+            {"pmc_id": 504},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"]["suggestions"], [])
+
+    # -- Confirm / Reject -----------------------------------------------
+
+    def test_confirm_happy_path_reconciles_both_sides(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=505)
+        token = self._make_token("matchowner505@example.com")
+        self._make_owner_with_pmc(
+            505, "matchowner505@example.com", token, 705, unit_id=8050, property_id=9050, pmc_id=505
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile,
+            500,
+            dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc),
+            source_txn_id=904,
+        )
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 505,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        line.refresh_from_db()
+        self.assertTrue(line.reconciled)
+        match = BankStatementMatch.objects.get(
+            bank_statement_line=line, journal_entry=entry
+        )
+        self.assertEqual(match.status, BankStatementMatch.CONFIRMED)
+
+    def test_confirm_statement_line_already_confirmed_elsewhere_rejected_409(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=506)
+        token = self._make_token("matchowner506@example.com")
+        self._make_owner_with_pmc(
+            506, "matchowner506@example.com", token, 706, unit_id=8060, property_id=9060, pmc_id=506
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry_1 = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=905
+        )
+        entry_2 = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 13, tzinfo=dt.timezone.utc), source_txn_id=906
+        )
+
+        first = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 506,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry_1.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(first.status_code, 200)
+
+        second = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 506,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry_2.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(second.status_code, 409)
+        self.assertFalse(
+            BankStatementMatch.objects.filter(
+                bank_statement_line=line,
+                journal_entry=entry_2,
+                status=BankStatementMatch.CONFIRMED,
+            ).exists()
+        )
+        # First pair's state is untouched.
+        match_1 = BankStatementMatch.objects.get(
+            bank_statement_line=line, journal_entry=entry_1
+        )
+        self.assertEqual(match_1.status, BankStatementMatch.CONFIRMED)
+
+    def test_confirm_journal_entry_already_confirmed_elsewhere_rejected_409(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=507)
+        token = self._make_token("matchowner507@example.com")
+        self._make_owner_with_pmc(
+            507, "matchowner507@example.com", token, 707, unit_id=8070, property_id=9070, pmc_id=507
+        )
+        line_a = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-A"
+        )
+        line_b = self._make_statement_line(
+            profile, datetime.date(2026, 6, 11), "500.00", "REF-B"
+        )
+        entry = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=907
+        )
+
+        first = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 507,
+                "bank_statement_line_id": line_a.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(first.status_code, 200)
+
+        second = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 507,
+                "bank_statement_line_id": line_b.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(second.status_code, 409)
+        line_b.refresh_from_db()
+        self.assertFalse(line_b.reconciled)
+
+    def test_confirm_manual_pairing_outside_suggestions_accepted(self):
+        """A journal_entry_id never returned by the suggestion heuristic
+        (different amount) is still accepted as a manual confirm."""
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=508)
+        token = self._make_token("matchowner508@example.com")
+        self._make_owner_with_pmc(
+            508, "matchowner508@example.com", token, 708, unit_id=8080, property_id=9080, pmc_id=508
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        # Different amount and far outside the date window -- the
+        # suggestion heuristic would never surface this pair.
+        entry = self._make_bank_journal_entry(
+            profile, 777, dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc), source_txn_id=908
+        )
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 508,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        line.refresh_from_db()
+        self.assertTrue(line.reconciled)
+
+    def test_reject_happy_path_neither_side_reconciled(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=509)
+        token = self._make_token("matchowner509@example.com")
+        self._make_owner_with_pmc(
+            509, "matchowner509@example.com", token, 709, unit_id=8090, property_id=9090, pmc_id=509
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=909
+        )
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 509,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "reject",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        line.refresh_from_db()
+        self.assertFalse(line.reconciled)
+        match = BankStatementMatch.objects.get(
+            bank_statement_line=line, journal_entry=entry
+        )
+        self.assertEqual(match.status, BankStatementMatch.REJECTED)
+
+    def test_reject_confirmed_pair_rejected_with_409(self):
+        """Post-review patch: rejecting an already-confirmed pair must not
+        silently flip it to rejected while leaving reconciled=True with no
+        confirmed match backing it -- an inconsistent state."""
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=512)
+        token = self._make_token("matchowner512@example.com")
+        self._make_owner_with_pmc(
+            512, "matchowner512@example.com", token, 712, unit_id=8120, property_id=9120, pmc_id=512
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=912
+        )
+
+        confirm_response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 512,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(confirm_response.status_code, 200)
+
+        reject_response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 512,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "reject",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(reject_response.status_code, 409)
+        line.refresh_from_db()
+        self.assertTrue(line.reconciled)
+        match = BankStatementMatch.objects.get(
+            bank_statement_line=line, journal_entry=entry
+        )
+        self.assertEqual(match.status, BankStatementMatch.CONFIRMED)
+
+    def test_suggestions_date_exactly_at_window_boundary_included(self):
+        """Post-review patch: exactly MATCH_DATE_WINDOW_DAYS (7) days apart
+        is still inside the closed interval and must be suggested -- locks
+        in the boundary against an off-by-one regression (e.g. > vs >=)."""
+        profile = self._make_profile(pmc_id=513)
+        token = self._make_token("matchowner513@example.com")
+        self._make_owner_with_pmc(
+            513, "matchowner513@example.com", token, 713, unit_id=8130, property_id=9130, pmc_id=513
+        )
+        self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        import datetime as dt
+
+        self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 17, tzinfo=dt.timezone.utc), source_txn_id=913
+        )
+
+        response = self.client.get(
+            self._suggested_matches_url(),
+            {"pmc_id": 513},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["content"]["suggestions"]), 1)
+
+    def test_reject_then_reconfirm_same_pair_succeeds(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=510)
+        token = self._make_token("matchowner510@example.com")
+        self._make_owner_with_pmc(
+            510, "matchowner510@example.com", token, 710, unit_id=8100, property_id=9100, pmc_id=510
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=910
+        )
+
+        reject_response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 510,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "reject",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(reject_response.status_code, 200)
+
+        confirm_response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 510,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(confirm_response.status_code, 200)
+        line.refresh_from_db()
+        self.assertTrue(line.reconciled)
+        match = BankStatementMatch.objects.get(
+            bank_statement_line=line, journal_entry=entry
+        )
+        self.assertEqual(match.status, BankStatementMatch.CONFIRMED)
+        # Exactly one row for this pair -- the reject transitioned in place,
+        # not a second row.
+        self.assertEqual(
+            BankStatementMatch.objects.filter(
+                bank_statement_line=line, journal_entry=entry
+            ).count(),
+            1,
+        )
+
+    def test_reconfirm_already_confirmed_pair_is_idempotent(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=511)
+        token = self._make_token("matchowner511@example.com")
+        self._make_owner_with_pmc(
+            511, "matchowner511@example.com", token, 711, unit_id=8110, property_id=9110, pmc_id=511
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=911
+        )
+
+        first = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 511,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(first.status_code, 200)
+
+        second = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 511,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(
+            BankStatementMatch.objects.filter(
+                bank_statement_line=line, journal_entry=entry
+            ).count(),
+            1,
+        )
+
+    def test_unknown_bank_statement_line_id_rejected_404(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=512)
+        token = self._make_token("matchowner512@example.com")
+        self._make_owner_with_pmc(
+            512, "matchowner512@example.com", token, 712, unit_id=8120, property_id=9120, pmc_id=512
+        )
+        entry = self._make_bank_journal_entry(
+            profile,
+            500,
+            dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc),
+            source_txn_id=912,
+        )
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 512,
+                "bank_statement_line_id": 999999,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_unknown_journal_entry_id_rejected_404(self):
+        profile = self._make_profile(pmc_id=513)
+        token = self._make_token("matchowner513@example.com")
+        self._make_owner_with_pmc(
+            513, "matchowner513@example.com", token, 713, unit_id=8130, property_id=9130, pmc_id=513
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 513,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": 999999,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_ids_belonging_to_different_pmc_rejected_404(self):
+        import datetime as dt
+
+        profile_a = self._make_profile(pmc_id=514)
+        profile_b = self._make_profile(pmc_id=515)
+        token_a = self._make_token("matchowner514@example.com")
+        self._make_owner_with_pmc(
+            514, "matchowner514@example.com", token_a, 714, unit_id=8140, property_id=9140, pmc_id=514
+        )
+        line_b = self._make_statement_line(
+            profile_b, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry_b = self._make_bank_journal_entry(
+            profile_b, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=913
+        )
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 514,
+                "bank_statement_line_id": line_b.id,
+                "journal_entry_id": entry_b.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token_a}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_invalid_action_rejected_400(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=516)
+        token = self._make_token("matchowner516@example.com")
+        self._make_owner_with_pmc(
+            516, "matchowner516@example.com", token, 716, unit_id=8160, property_id=9160, pmc_id=516
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=914
+        )
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 516,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "maybe",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    # -- Auth / scope -----------------------------------------------------
+
+    def test_suggestions_unauthenticated_rejected_401(self):
+        self._make_profile(pmc_id=517)
+
+        response = self.client.get(self._suggested_matches_url(), {"pmc_id": 517})
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_suggestions_unreachable_pmc_rejected_403(self):
+        self._make_profile(pmc_id=518)
+        token = self._make_token("matchowner518@example.com")
+        self._make_owner_with_pmc(
+            518, "matchowner518@example.com", token, 718, unit_id=8180, property_id=9180, pmc_id=519
+        )
+
+        response = self.client.get(
+            self._suggested_matches_url(),
+            {"pmc_id": 518},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_suggestions_nonexistent_pmc_rejected_404(self):
+        token = self._make_token("matchowner520@example.com")
+        self._make_owner_with_pmc(
+            520, "matchowner520@example.com", token, 720, unit_id=8200, property_id=9200, pmc_id=999
+        )
+
+        response = self.client.get(
+            self._suggested_matches_url(),
+            {"pmc_id": 999},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_match_unauthenticated_rejected_401(self):
+        self._make_profile(pmc_id=521)
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 521,
+                "bank_statement_line_id": 1,
+                "journal_entry_id": 1,
+                "action": "confirm",
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_match_unreachable_pmc_rejected_403(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=522)
+        token = self._make_token("matchowner522@example.com")
+        self._make_owner_with_pmc(
+            522, "matchowner522@example.com", token, 722, unit_id=8220, property_id=9220, pmc_id=523
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=915
+        )
+
+        response = self.client.post(
+            self._match_url(),
+            {
+                "pmc_id": 522,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_suggested_matches_no_trailing_slash_url_also_works(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=524)
+        token = self._make_token("matchowner524@example.com")
+        self._make_owner_with_pmc(
+            524, "matchowner524@example.com", token, 724, unit_id=8240, property_id=9240, pmc_id=524
+        )
+        self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=916
+        )
+
+        response = self.client.get(
+            reverse("suggested-matches-no-slash"),
+            {"pmc_id": 524},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["content"]["suggestions"]), 1)
+
+    def test_match_no_trailing_slash_url_also_works(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=525)
+        token = self._make_token("matchowner525@example.com")
+        self._make_owner_with_pmc(
+            525, "matchowner525@example.com", token, 725, unit_id=8250, property_id=9250, pmc_id=525
+        )
+        line = self._make_statement_line(
+            profile, datetime.date(2026, 6, 10), "500.00", "REF-1"
+        )
+        entry = self._make_bank_journal_entry(
+            profile, 500, dt.datetime(2026, 6, 12, tzinfo=dt.timezone.utc), source_txn_id=917
+        )
+
+        response = self.client.post(
+            reverse("apply-bank-statement-match-no-slash"),
+            {
+                "pmc_id": 525,
+                "bank_statement_line_id": line.id,
+                "journal_entry_id": entry.id,
+                "action": "confirm",
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        line.refresh_from_db()
+        self.assertTrue(line.reconciled)

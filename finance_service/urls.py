@@ -4,9 +4,11 @@ from django.urls import path
 
 from ledger.views import (
     ageing_report,
+    apply_bank_statement_match,
     balance_sheet_report,
     bank_statement_import,
     profit_loss_report,
+    suggested_matches,
     sync_lease,
     sync_lease_transaction,
     trial_balance_report,
@@ -107,5 +109,28 @@ urlpatterns = [
         'reconciliation/bank-statement-import',
         bank_statement_import,
         name='bank-statement-import-no-slash',
+    ),
+    # Story 4.2: Match statement lines to Ledger entries -- trailing-slash +
+    # no-slash pair, matching the established route-pair convention above
+    # (spec Code Map).
+    path(
+        'reconciliation/suggested-matches/',
+        suggested_matches,
+        name='suggested-matches',
+    ),
+    path(
+        'reconciliation/suggested-matches',
+        suggested_matches,
+        name='suggested-matches-no-slash',
+    ),
+    path(
+        'reconciliation/match/',
+        apply_bank_statement_match,
+        name='apply-bank-statement-match',
+    ),
+    path(
+        'reconciliation/match',
+        apply_bank_statement_match,
+        name='apply-bank-statement-match-no-slash',
     ),
 ]

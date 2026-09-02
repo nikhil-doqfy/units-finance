@@ -32,7 +32,12 @@ from rest_framework.decorators import api_view
 
 from ledger.auth import authenticate_reporting_request
 from ledger.decorators import require_internal_token
-from ledger.models import FinancePMCProfile, LeaseRef, LeaseTransactionRef
+from ledger.models import (
+    BankStatementMatch,
+    FinancePMCProfile,
+    LeaseRef,
+    LeaseTransactionRef,
+)
 from ledger.org_scope import get_pmc_ids_for_user_profile
 from ledger.posting import (
     RENT_CHEQUE,
@@ -43,7 +48,13 @@ from ledger.posting import (
     post_rent_ar,
     post_security_deposit,
 )
-from ledger.reconciliation import BankStatementImportError, import_bank_statement_csv
+from ledger.reconciliation import (
+    BankStatementImportError,
+    BankStatementMatchError,
+    apply_match_decision,
+    find_suggested_matches,
+    import_bank_statement_csv,
+)
 from ledger.reports import (
     compute_ageing,
     compute_balance_sheet,
@@ -645,4 +656,204 @@ def bank_statement_import(request):
         content={"pmc_id": pmc_id, "created": created_count},
         message="Bank statement imported",
         status=201,
+    )
+
+
+@api_view(["GET"])
+def suggested_matches(request):
+    """Story 4.2: `GET /reconciliation/suggested-matches` (FR-15).
+
+    `pmc_id` is a required query param. Same auth -> parse/validate ->
+    resolve-profile -> scope-check sequence as every other Finance endpoint
+    (spec Always), then delegates the heuristic itself to
+    `find_suggested_matches` (copying the auth/scope/404 skeleton from
+    `bank_statement_import`, spec Code Map):
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id` -- 400 on failure, before any query runs.
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Run the heuristic and respond -- one entry per matchable pair.
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    if pmc_id is None:
+        return prepare_response(
+            content={"pmc_id": raw_pmc_id},
+            message="pmc_id is required",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view matches for this PMC",
+            status=403,
+        )
+
+    matches = find_suggested_matches(finance_pmc_profile)
+    suggestions = [
+        {
+            "bank_statement_line_id": match["bank_statement_line"].id,
+            "journal_entry_id": match["journal_entry"].id,
+            "amount": str(match["bank_statement_line"].amount),
+            "statement_date": match["bank_statement_line"].statement_date.isoformat(),
+            "posted_at": match["journal_entry"].posted_at.isoformat(),
+        }
+        for match in matches
+    ]
+
+    return prepare_response(
+        content={"pmc_id": pmc_id, "suggestions": suggestions},
+        message="Suggested matches generated",
+        status=200,
+    )
+
+
+@api_view(["POST"])
+def apply_bank_statement_match(request):
+    """Story 4.2: `POST /reconciliation/match` (FR-15).
+
+    `pmc_id`, `bank_statement_line_id`, `journal_entry_id`, `action`
+    (`confirm`|`reject`) are all required. Same auth -> parse/validate ->
+    resolve-profile -> scope-check sequence as every other Finance endpoint
+    (spec Always), then delegates the confirm/reject state transition to
+    `apply_match_decision` (spec Code Map), translating its
+    `BankStatementMatchError.status` into the response:
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id`/`bank_statement_line_id`/
+         `journal_entry_id`/`action` -- 400 on failure, before any query
+         runs (`action` must be exactly `confirm` or `reject`).
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Delegate to `apply_match_decision` -- 404/409 on its own
+         validation failures, 200 on success.
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.data.get("pmc_id")
+    raw_bank_statement_line_id = request.data.get("bank_statement_line_id")
+    raw_journal_entry_id = request.data.get("journal_entry_id")
+    action = request.data.get("action")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    bank_statement_line_id = None
+    if raw_bank_statement_line_id is not None:
+        try:
+            bank_statement_line_id = int(raw_bank_statement_line_id)
+        except (TypeError, ValueError):
+            bank_statement_line_id = None
+
+    journal_entry_id = None
+    if raw_journal_entry_id is not None:
+        try:
+            journal_entry_id = int(raw_journal_entry_id)
+        except (TypeError, ValueError):
+            journal_entry_id = None
+
+    action_map = {
+        "confirm": BankStatementMatch.CONFIRMED,
+        "reject": BankStatementMatch.REJECTED,
+    }
+
+    if (
+        pmc_id is None
+        or bank_statement_line_id is None
+        or journal_entry_id is None
+        or action not in action_map
+    ):
+        return prepare_response(
+            content={
+                "pmc_id": raw_pmc_id,
+                "bank_statement_line_id": raw_bank_statement_line_id,
+                "journal_entry_id": raw_journal_entry_id,
+                "action": action,
+            },
+            message="pmc_id, bank_statement_line_id, journal_entry_id, and "
+            "a valid action ('confirm' or 'reject') are required",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to modify matches for this PMC",
+            status=403,
+        )
+
+    try:
+        result = apply_match_decision(
+            finance_pmc_profile,
+            bank_statement_line_id,
+            journal_entry_id,
+            action_map[action],
+        )
+    except BankStatementMatchError as exc:
+        return prepare_response(
+            content={
+                "pmc_id": pmc_id,
+                "bank_statement_line_id": bank_statement_line_id,
+                "journal_entry_id": journal_entry_id,
+            },
+            message=str(exc),
+            status=exc.status,
+        )
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "bank_statement_line_id": bank_statement_line_id,
+            "journal_entry_id": journal_entry_id,
+            "status": result["status"],
+        },
+        message="Match decision applied",
+        status=200,
     )
