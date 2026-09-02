@@ -5,6 +5,7 @@ from django.urls import path
 from ledger.views import (
     ageing_report,
     balance_sheet_report,
+    bank_statement_import,
     profit_loss_report,
     sync_lease,
     sync_lease_transaction,
@@ -94,5 +95,17 @@ urlpatterns = [
         'reports/ageing',
         ageing_report,
         name='ageing-report-no-slash',
+    ),
+    # Story 4.1: Bank statement import -- trailing-slash + no-slash pair,
+    # matching the established route-pair precedent above (spec Code Map).
+    path(
+        'reconciliation/bank-statement-import/',
+        bank_statement_import,
+        name='bank-statement-import',
+    ),
+    path(
+        'reconciliation/bank-statement-import',
+        bank_statement_import,
+        name='bank-statement-import-no-slash',
     ),
 ]

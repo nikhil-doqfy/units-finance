@@ -16,6 +16,9 @@ applied, we create/drop the table ourselves around this test case so the
 command's existence check has something real to query, without ever
 importing units-backend's code (consistent with the spec's Design Notes).
 """
+import datetime
+import decimal
+
 import jwt
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -25,7 +28,13 @@ from django.urls import reverse
 from django.utils import timezone
 
 from ledger.auth import authenticate_reporting_request
-from ledger.models import Account, FinancePMCProfile, JournalEntry, LedgerLine
+from ledger.models import (
+    Account,
+    BankStatementLine,
+    FinancePMCProfile,
+    JournalEntry,
+    LedgerLine,
+)
 from ledger.org_scope import get_pmc_ids_for_user_profile
 from ledger.posting import (
     post_bounce_fee,
@@ -5637,3 +5646,571 @@ class AgeingReportTests(TrialBalanceReportTests):
         )
 
         self.assertEqual(response.status_code, 401)
+
+
+@override_settings(
+    JWT_SECRET_KEY="test-jwt-secret-4-1", JWT_ALGORITHM="HS256"
+)
+class BankStatementImportTests(TestCase):
+    """Story 4.1 tests: POST /reconciliation/bank-statement-import.
+
+    Follows `TrialBalanceReportTests`'s stand-in-table fixture pattern (own
+    class, not a subclass -- this story has no report-computation logic to
+    inherit, spec Code Map) for exercising the Owner branch of
+    `get_pmc_ids_for_user_profile` through the real HTTP view.
+
+    Covers every I/O Matrix row from the spec:
+      1. Happy path -- valid CSV, 5 rows, all columns present -> 201,
+         content.created == 5.
+      2. Missing/invalid JWT -> 401.
+      3. pmc_id not reachable by caller -> 403.
+      4. pmc_id has no FinancePMCProfile -> 404.
+      5. Missing required column -> 400, no rows created.
+      6. Row with unparsable amount/date -> 400, no rows created
+         (whole-file rejection).
+      7. Empty CSV (headers only) -> 201, content.created == 0.
+      8. No file provided -> 400.
+    Plus the two Acceptance Criteria rows: cross-PMC disjointness, and the
+    no-trailing-slash URL variant.
+    """
+
+    JWT_SECRET_KEY = "test-jwt-secret-4-1"
+    JWT_ALGORITHM = "HS256"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_userprofile (
+                    id BIGSERIAL PRIMARY KEY,
+                    email VARCHAR(255),
+                    token TEXT,
+                    user_id BIGINT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_owner (
+                    userprofile_ptr_id BIGINT PRIMARY KEY
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_service_propertymanager (
+                    userprofile_ptr_id BIGINT PRIMARY KEY,
+                    company_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_pmcpmmapping (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT NOT NULL,
+                    pm_id BIGINT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unitowner (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT NOT NULL,
+                    owner_id BIGINT,
+                    ownership_percent NUMERIC(5, 2) NOT NULL DEFAULT 100
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            for table in (
+                "property_unitowner",
+                "property_unit",
+                "property_property",
+                "property_pmcpmmapping",
+                "user_service_propertymanager",
+                "user_service_owner",
+                "user_service_userprofile",
+            ):
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+        super().tearDownClass()
+
+    def setUp(self):
+        from django.contrib.auth.models import User
+
+        User.objects.all().delete()
+        with connection.cursor() as cursor:
+            for table in (
+                "property_unitowner",
+                "property_unit",
+                "property_property",
+                "property_pmcpmmapping",
+                "user_service_propertymanager",
+                "user_service_owner",
+                "user_service_userprofile",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _url(self):
+        return reverse("bank-statement-import")
+
+    def _make_token(self, email, exp_delta_seconds=3600):
+        import datetime as dt
+
+        payload = {
+            "user_id": 1,
+            "email": email,
+            "exp": dt.datetime.utcnow() + dt.timedelta(seconds=exp_delta_seconds),
+        }
+        return jwt.encode(payload, self.JWT_SECRET_KEY, algorithm=self.JWT_ALGORITHM)
+
+    def _make_owner_with_pmc(
+        self, profile_id, email, token, auth_user_id, unit_id, property_id, pmc_id
+    ):
+        from django.contrib.auth.models import User
+
+        User.objects.create(
+            id=auth_user_id,
+            username=f"owner{auth_user_id}",
+            email=email,
+            is_active=True,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO user_service_userprofile (id, email, token, user_id) "
+                "VALUES (%s, %s, %s, %s)",
+                [profile_id, email, token, auth_user_id],
+            )
+            cursor.execute(
+                "INSERT INTO user_service_owner (userprofile_ptr_id) VALUES (%s)",
+                [profile_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [property_id, pmc_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [unit_id, property_id],
+            )
+            cursor.execute(
+                "INSERT INTO property_unitowner (unit_id, owner_id) VALUES (%s, %s)",
+                [unit_id, profile_id],
+            )
+
+    def _make_profile(self, pmc_id):
+        return FinancePMCProfile.objects.create(
+            pmc_id=pmc_id,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+    def _csv_file(self, text, name="statement.csv"):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        return SimpleUploadedFile(name, text.encode("utf-8"), content_type="text/csv")
+
+    def test_happy_path_creates_one_row_per_data_row(self):
+        profile = self._make_profile(pmc_id=401)
+        token = self._make_token("bsiowner401@example.com")
+        self._make_owner_with_pmc(
+            401, "bsiowner401@example.com", token, 601, unit_id=4010, property_id=5010, pmc_id=401
+        )
+        csv_text = (
+            "date,amount,reference\n"
+            "2026-01-01,100.00,REF-1\n"
+            "2026-01-02,200.50,REF-2\n"
+            "2026-01-03,-50.25,REF-3\n"
+            "2026-01-04,0,REF-4\n"
+            "2026-01-05,999.99,REF-5\n"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 401, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["content"]["created"], 5)
+        rows = BankStatementLine.objects.filter(finance_pmc_profile=profile)
+        self.assertEqual(rows.count(), 5)
+        row1 = rows.get(reference="REF-2")
+        self.assertEqual(row1.amount, decimal.Decimal("200.50"))
+        self.assertEqual(row1.statement_date, datetime.date(2026, 1, 2))
+        self.assertFalse(row1.reconciled)
+
+    def test_header_case_insensitive_and_whitespace_tolerant(self):
+        profile = self._make_profile(pmc_id=402)
+        token = self._make_token("bsiowner402@example.com")
+        self._make_owner_with_pmc(
+            402, "bsiowner402@example.com", token, 602, unit_id=4020, property_id=5020, pmc_id=402
+        )
+        csv_text = " Date , AMOUNT ,Reference\n2026-02-01,10.00,REF-A\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 402, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["content"]["created"], 1)
+        self.assertEqual(
+            BankStatementLine.objects.filter(finance_pmc_profile=profile).count(), 1
+        )
+
+    def test_cross_pmc_rows_are_disjoint(self):
+        profile_a = self._make_profile(pmc_id=403)
+        profile_b = self._make_profile(pmc_id=404)
+        token_a = self._make_token("bsiowner403@example.com")
+        token_b = self._make_token("bsiowner404@example.com")
+        self._make_owner_with_pmc(
+            403, "bsiowner403@example.com", token_a, 603, unit_id=4030, property_id=5030, pmc_id=403
+        )
+        self._make_owner_with_pmc(
+            404, "bsiowner404@example.com", token_b, 604, unit_id=4040, property_id=5040, pmc_id=404
+        )
+        csv_text = "date,amount,reference\n2026-03-01,10.00,REF-X\n2026-03-02,20.00,REF-Y\n"
+
+        response_a = self.client.post(
+            self._url(),
+            {"pmc_id": 403, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token_a}",
+        )
+        response_b = self.client.post(
+            self._url(),
+            {"pmc_id": 404, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token_b}",
+        )
+
+        self.assertEqual(response_a.status_code, 201)
+        self.assertEqual(response_b.status_code, 201)
+        rows_a = BankStatementLine.objects.filter(finance_pmc_profile=profile_a)
+        rows_b = BankStatementLine.objects.filter(finance_pmc_profile=profile_b)
+        self.assertEqual(rows_a.count(), 2)
+        self.assertEqual(rows_b.count(), 2)
+        self.assertEqual(set(rows_a.values_list("id", flat=True)) & set(
+            rows_b.values_list("id", flat=True)
+        ), set())
+
+    def test_empty_csv_creates_zero_rows(self):
+        self._make_profile(pmc_id=405)
+        token = self._make_token("bsiowner405@example.com")
+        self._make_owner_with_pmc(
+            405, "bsiowner405@example.com", token, 605, unit_id=4050, property_id=5050, pmc_id=405
+        )
+        csv_text = "date,amount,reference\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 405, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["content"]["created"], 0)
+
+    def test_missing_required_column_rejected_with_400_and_creates_nothing(self):
+        self._make_profile(pmc_id=406)
+        token = self._make_token("bsiowner406@example.com")
+        self._make_owner_with_pmc(
+            406, "bsiowner406@example.com", token, 606, unit_id=4060, property_id=5060, pmc_id=406
+        )
+        csv_text = "date,amount\n2026-01-01,10.00\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 406, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reference", response.json()["message"])
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_unparsable_amount_rejected_with_400_names_row_and_creates_nothing(self):
+        self._make_profile(pmc_id=407)
+        token = self._make_token("bsiowner407@example.com")
+        self._make_owner_with_pmc(
+            407, "bsiowner407@example.com", token, 607, unit_id=4070, property_id=5070, pmc_id=407
+        )
+        csv_text = (
+            "date,amount,reference\n"
+            "2026-01-01,100.00,REF-1\n"
+            "2026-01-02,abc,REF-2\n"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 407, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Row 2", response.json()["message"])
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_unparsable_date_rejected_with_400_names_row_and_creates_nothing(self):
+        self._make_profile(pmc_id=408)
+        token = self._make_token("bsiowner408@example.com")
+        self._make_owner_with_pmc(
+            408, "bsiowner408@example.com", token, 608, unit_id=4080, property_id=5080, pmc_id=408
+        )
+        csv_text = "date,amount,reference\nnot-a-date,100.00,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 408, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Row 1", response.json()["message"])
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_over_precision_amount_rejected_with_400_not_silently_rounded(self):
+        """Post-review patch: a 3-decimal-place amount must be rejected, not
+        silently quantized by Decimal.quantize's default rounding."""
+        self._make_profile(pmc_id=416)
+        token = self._make_token("bsiowner416@example.com")
+        self._make_owner_with_pmc(
+            416, "bsiowner416@example.com", token, 616, unit_id=4160, property_id=5160, pmc_id=416
+        )
+        csv_text = "date,amount,reference\n2026-01-01,10.005,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 416, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Row 1", response.json()["message"])
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_amount_exceeding_max_digits_rejected_with_400(self):
+        """Post-review patch: an amount too large for the DecimalField
+        (max_digits=14, decimal_places=2) must be rejected with 400, not
+        surfaced as an unhandled DB error from bulk_create."""
+        self._make_profile(pmc_id=417)
+        token = self._make_token("bsiowner417@example.com")
+        self._make_owner_with_pmc(
+            417, "bsiowner417@example.com", token, 617, unit_id=4170, property_id=5170, pmc_id=417
+        )
+        csv_text = "date,amount,reference\n2026-01-01,9999999999999.99,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 417, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Row 1", response.json()["message"])
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_nan_and_infinity_amount_rejected_with_400(self):
+        """Post-review patch: Decimal('NaN')/Decimal('Infinity') parse
+        successfully as Decimals but must not be accepted as amounts."""
+        self._make_profile(pmc_id=418)
+        token = self._make_token("bsiowner418@example.com")
+        self._make_owner_with_pmc(
+            418, "bsiowner418@example.com", token, 618, unit_id=4180, property_id=5180, pmc_id=418
+        )
+        csv_text = "date,amount,reference\n2026-01-01,NaN,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 418, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_reference_over_max_length_rejected_with_400(self):
+        """Post-review patch: a reference longer than the CharField's
+        max_length=255 must be rejected with 400, not a raw DB error."""
+        self._make_profile(pmc_id=419)
+        token = self._make_token("bsiowner419@example.com")
+        self._make_owner_with_pmc(
+            419, "bsiowner419@example.com", token, 619, unit_id=4190, property_id=5190, pmc_id=419
+        )
+        long_reference = "X" * 256
+        csv_text = f"date,amount,reference\n2026-01-01,10.00,{long_reference}\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 419, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Row 1", response.json()["message"])
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_duplicate_case_insensitive_header_rejected_with_400(self):
+        """Post-review patch: two columns normalizing to the same header
+        name (e.g. 'date' and 'DATE') must be rejected, not silently
+        collapsed with one overwriting the other."""
+        self._make_profile(pmc_id=420)
+        token = self._make_token("bsiowner420@example.com")
+        self._make_owner_with_pmc(
+            420, "bsiowner420@example.com", token, 620, unit_id=4200, property_id=5200, pmc_id=420
+        )
+        csv_text = "date,amount,DATE,reference\n2026-01-01,10.00,2026-02-02,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 420, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_invalid_file_encoding_rejected_with_400(self):
+        """Post-review patch: a file that isn't valid utf-8-sig must be
+        rejected with 400, not an unhandled UnicodeDecodeError."""
+        self._make_profile(pmc_id=421)
+        token = self._make_token("bsiowner421@example.com")
+        self._make_owner_with_pmc(
+            421, "bsiowner421@example.com", token, 621, unit_id=4210, property_id=5210, pmc_id=421
+        )
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        bad_file = SimpleUploadedFile(
+            "statement.csv",
+            "date,amount,reference\n2026-01-01,10.00,café\n".encode("utf-16"),
+            content_type="text/csv",
+        )
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 421, "file": bad_file},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_no_file_provided_rejected_with_400(self):
+        self._make_profile(pmc_id=409)
+        token = self._make_token("bsiowner409@example.com")
+        self._make_owner_with_pmc(
+            409, "bsiowner409@example.com", token, 609, unit_id=4090, property_id=5090, pmc_id=409
+        )
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 409},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_unauthenticated_request_rejected_with_401_before_any_query(self):
+        self._make_profile(pmc_id=410)
+        csv_text = "date,amount,reference\n2026-01-01,10.00,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 410, "file": self._csv_file(csv_text)},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["status"], 401)
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_expired_token_rejected_with_401(self):
+        token = self._make_token("bsiowner411@example.com", exp_delta_seconds=-10)
+        self._make_profile(pmc_id=411)
+        csv_text = "date,amount,reference\n2026-01-01,10.00,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 411, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_unreachable_pmc_id_rejected_with_403(self):
+        self._make_profile(pmc_id=412)
+        # Owner is scoped to pmc_id=413, not pmc_id=412.
+        token = self._make_token("bsiowner412@example.com")
+        self._make_owner_with_pmc(
+            412, "bsiowner412@example.com", token, 612, unit_id=4120, property_id=5120, pmc_id=413
+        )
+        csv_text = "date,amount,reference\n2026-01-01,10.00,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 412, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["status"], 403)
+        self.assertEqual(BankStatementLine.objects.count(), 0)
+
+    def test_nonexistent_pmc_id_rejected_with_404(self):
+        token = self._make_token("bsiowner414@example.com")
+        self._make_owner_with_pmc(
+            414, "bsiowner414@example.com", token, 614, unit_id=4140, property_id=5140, pmc_id=999
+        )
+        csv_text = "date,amount,reference\n2026-01-01,10.00,REF-1\n"
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 999, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["status"], 404)
+
+    def test_no_trailing_slash_url_also_works(self):
+        profile = self._make_profile(pmc_id=415)
+        token = self._make_token("bsiowner415@example.com")
+        self._make_owner_with_pmc(
+            415, "bsiowner415@example.com", token, 615, unit_id=4150, property_id=5150, pmc_id=415
+        )
+        csv_text = "date,amount,reference\n2026-01-01,10.00,REF-1\n"
+
+        response = self.client.post(
+            reverse("bank-statement-import-no-slash"),
+            {"pmc_id": 415, "file": self._csv_file(csv_text)},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            BankStatementLine.objects.filter(finance_pmc_profile=profile).count(), 1
+        )

@@ -178,6 +178,49 @@ class LedgerLine(models.Model):
         )
 
 
+class BankStatementLine(models.Model):
+    """One row of an uploaded bank statement, scoped to a `FinancePMCProfile`
+    (Story 4.1, FR-14).
+
+    There is no PMC-owned bank-account entity anywhere in either service
+    (units-backend's `Bank` model is a generic branch directory with no
+    PMC/Property/Unit linkage, confirmed by investigation) -- human-confirmed
+    to scope statement lines to `FinancePMCProfile` directly, no separate
+    bank-account entity in Phase 1 (spec Intent).
+
+    `finance_pmc_profile` is a real Django `ForeignKey` -- both
+    `BankStatementLine` and `FinancePMCProfile` are Finance-owned models
+    living in this same app/database, following the `Account`/`JournalEntry`
+    FK convention (spec Boundaries & Constraints), never a plain
+    `BigIntegerField` (that pattern is reserved for units-backend mirrors,
+    AD-19).
+
+    `amount` is `Decimal`, 2dp, matching `LedgerLine.debit`/`credit`'s
+    convention (spec Boundaries & Constraints). `reconciled` defaults to
+    `False` -- added now so Story 4.2's match-state recording doesn't need a
+    second migration touching this table (spec Ask First).
+    """
+
+    finance_pmc_profile = models.ForeignKey(
+        FinancePMCProfile,
+        on_delete=models.CASCADE,
+        related_name="bank_statement_lines",
+    )
+    statement_date = models.DateField()
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    reference = models.CharField(max_length=255)
+    reconciled = models.BooleanField(default=False)
+    created = models.DateTimeField(auto_now_add=True)
+    modified = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return (
+            f"BankStatementLine(finance_pmc_profile_id={self.finance_pmc_profile_id}, "
+            f"statement_date={self.statement_date}, amount={self.amount}, "
+            f"reference={self.reference})"
+        )
+
+
 class LeaseTransactionRef(models.Model):
     """Read-only reference onto units-backend's LeaseTransaction table.
 

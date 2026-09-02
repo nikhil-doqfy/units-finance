@@ -43,6 +43,7 @@ from ledger.posting import (
     post_rent_ar,
     post_security_deposit,
 )
+from ledger.reconciliation import BankStatementImportError, import_bank_statement_csv
 from ledger.reports import (
     compute_ageing,
     compute_balance_sheet,
@@ -561,4 +562,87 @@ def ageing_report(request):
         status=200,
         paginator=ageing["page_obj"],
         total_records=ageing["total_records"],
+    )
+
+
+@api_view(["POST"])
+def bank_statement_import(request):
+    """Story 4.1: `POST /reconciliation/bank-statement-import` (FR-14).
+
+    `pmc_id` and `file` (multipart/form-data) are required. Same auth ->
+    parse/validate -> resolve-profile -> scope-check sequence as
+    `trial_balance_report` (spec Code Map), adapted for a file upload instead
+    of GET query params:
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id` -- 400 on failure, before any query runs.
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Require a `file` in `request.FILES` -- 400 if missing.
+      6. Delegate to `ledger.reconciliation.import_bank_statement_csv` --
+         whole-file rejection (400, naming the problem) on any row/column
+         parse failure, no partial writes (spec Always/Never).
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.data.get("pmc_id")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    if pmc_id is None:
+        return prepare_response(
+            content={"pmc_id": raw_pmc_id},
+            message="pmc_id is required",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to import bank statements for this PMC",
+            status=403,
+        )
+
+    uploaded_file = request.FILES.get("file")
+    if uploaded_file is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="file is required",
+            status=400,
+        )
+
+    try:
+        created_count = import_bank_statement_csv(finance_pmc_profile, uploaded_file)
+    except BankStatementImportError as exc:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message=str(exc),
+            status=400,
+        )
+
+    return prepare_response(
+        content={"pmc_id": pmc_id, "created": created_count},
+        message="Bank statement imported",
+        status=201,
     )
