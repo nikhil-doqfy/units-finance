@@ -27,6 +27,7 @@ from ledger.posting import (
     post_bounce_fee,
     post_bounce_reversal,
     post_cheque_clearing,
+    post_commission_split,
     post_rent_ar,
     post_security_deposit,
 )
@@ -527,7 +528,8 @@ class PostRentArTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
-                    parent_property_id BIGINT
+                    parent_property_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
                 )
                 """
             )
@@ -840,7 +842,8 @@ class PostChequeClearingTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
-                    parent_property_id BIGINT
+                    parent_property_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
                 )
                 """
             )
@@ -1204,7 +1207,8 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
-                    parent_property_id BIGINT
+                    parent_property_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
                 )
                 """
             )
@@ -1346,7 +1350,8 @@ class PostBounceReversalTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
-                    parent_property_id BIGINT
+                    parent_property_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
                 )
                 """
             )
@@ -1844,7 +1849,8 @@ class PostBounceFeeTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
-                    parent_property_id BIGINT
+                    parent_property_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
                 )
                 """
             )
@@ -2475,7 +2481,8 @@ class PostSecurityDepositTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
-                    parent_property_id BIGINT
+                    parent_property_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
                 )
                 """
             )
@@ -2810,7 +2817,8 @@ class SyncLeaseEndpointTests(TestCase):
                 """
                 CREATE TABLE IF NOT EXISTS property_unit (
                     id BIGSERIAL PRIMARY KEY,
-                    parent_property_id BIGINT
+                    parent_property_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
                 )
                 """
             )
@@ -2944,3 +2952,490 @@ class SyncLeaseEndpointTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["content"], {"lease_id": 999999})
+
+
+class PostCommissionSplitTests(TestCase):
+    """Story 2.7 tests: post_commission_split posting logic.
+
+    Extends the established hand-rolled stand-in-table technique
+    (LeaseTransactionRef/LeaseRef/UnitRef/PropertyRef) with a new stand-in
+    `property_unitowner` table (UnitOwnerRef) and a `commission_percent`
+    column on the stand-in `property_unit` table (UnitRef), exercising the
+    real chain-walking/commission-computation code path without importing
+    units-backend.
+
+    Covers all six I/O matrix rows from the spec:
+      1. Simple commission split, no owners -- 8% commission on 10,000 rent
+         posts a balanced 3-line entry (Commission Expense 800, AP — PMC
+         Commission 800, VAT Payable 40).
+      2. No commission configured -- commission_percent null or 0 -> no
+         posting, not a failure.
+      3. Rent AR did not post -- post_commission_split is simply never
+         called by the view in this case (asserted at the view level).
+      4. Duplicate sync -- second call for the same
+         (lease_transaction_id, "COMMISSION") is a no-op.
+      5. Owners sum to 100 -- two UnitOwner rows (60/40) still post the
+         same 3 lines (the split itself doesn't vary by owner count).
+      6. Owners don't sum to 100 -- posting fails loudly with
+         "invalid_ownership_split", no partial post.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_leasetransaction (
+                    id BIGSERIAL PRIMARY KEY,
+                    lease_id BIGINT NOT NULL,
+                    amount DOUBLE PRECISION,
+                    cheque_type VARCHAR(20) NOT NULL,
+                    payment_type VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_lease (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unitowner (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT NOT NULL,
+                    ownership_percent NUMERIC(5, 2) NOT NULL
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS lease_leasetransaction")
+            cursor.execute("DROP TABLE IF EXISTS lease_lease")
+            cursor.execute("DROP TABLE IF EXISTS property_unit")
+            cursor.execute("DROP TABLE IF EXISTS property_property")
+            cursor.execute("DROP TABLE IF EXISTS property_unitowner")
+        super().tearDownClass()
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            for table in (
+                "lease_leasetransaction",
+                "lease_lease",
+                "property_unit",
+                "property_property",
+                "property_unitowner",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _insert_chain(
+        self,
+        cursor,
+        txn_id,
+        lease_id,
+        unit_id,
+        property_id,
+        pmc_id,
+        cheque_type="RENT_CHEQUE",
+        amount=10000,
+        status="BALANCE",
+        commission_percent=8,
+    ):
+        cursor.execute(
+            """
+            INSERT INTO lease_leasetransaction
+                (id, lease_id, amount, cheque_type, payment_type, status)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            [txn_id, lease_id, amount, cheque_type, "CHEQUE", status],
+        )
+        cursor.execute(
+            "INSERT INTO lease_lease (id, unit_id) VALUES (%s, %s)",
+            [lease_id, unit_id],
+        )
+        cursor.execute(
+            "INSERT INTO property_unit "
+            "(id, parent_property_id, commission_percent) VALUES (%s, %s, %s)",
+            [unit_id, property_id, commission_percent],
+        )
+        cursor.execute(
+            "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+            [property_id, pmc_id],
+        )
+
+    def _insert_owner(self, cursor, unit_id, ownership_percent):
+        cursor.execute(
+            "INSERT INTO property_unitowner (unit_id, ownership_percent) "
+            "VALUES (%s, %s)",
+            [unit_id, ownership_percent],
+        )
+
+    def _make_profile(self, pmc_id=1):
+        return FinancePMCProfile.objects.create(
+            pmc_id=pmc_id,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+    def test_simple_commission_split_no_owners_posts_balanced_three_lines(self):
+        profile = self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=400,
+                lease_id=40,
+                unit_id=50,
+                property_id=60,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=8,
+            )
+
+        rent_result = post_rent_ar(400)
+        self.assertTrue(rent_result["posted"])
+
+        result = post_commission_split(400)
+
+        self.assertTrue(result["posted"])
+        entries = JournalEntry.objects.filter(
+            source_lease_transaction_id=400,
+            source_status_transition="COMMISSION",
+        )
+        self.assertEqual(entries.count(), 1)
+        entry = entries.first()
+        self.assertEqual(entry.finance_pmc_profile_id, profile.id)
+
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 3)
+
+        expense_line = lines.get(account__name="Commission Expense")
+        ap_line = lines.get(account__name="AP — PMC Commission")
+        vat_line = lines.get(account__name="VAT Payable")
+
+        # Commission Expense debits the full 840 (commission + VAT
+        # together, mirroring post_bounce_fee's AR-debits-fee+VAT
+        # precedent) -- the CoA has no separate account for VAT's debit
+        # side, so it must be folded into this line for the entry to
+        # balance (NFR-1).
+        self.assertEqual(expense_line.debit, 840)
+        self.assertEqual(expense_line.credit, 0)
+        self.assertEqual(ap_line.debit, 0)
+        self.assertEqual(ap_line.credit, 800)
+        self.assertEqual(vat_line.debit, 0)
+        self.assertEqual(vat_line.credit, 40)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 840)
+
+        # Two JournalEntries total for this lease_transaction_id -- the
+        # rent AR posting plus this commission split.
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=400).count(), 2
+        )
+
+    def test_no_commission_configured_null_posts_nothing(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=401,
+                lease_id=41,
+                unit_id=51,
+                property_id=61,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=None,
+            )
+
+        self.assertTrue(post_rent_ar(401)["posted"])
+
+        result = post_commission_split(401)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_commission_configured")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=401,
+                source_status_transition="COMMISSION",
+            ).count(),
+            0,
+        )
+
+    def test_no_commission_configured_zero_posts_nothing(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=402,
+                lease_id=42,
+                unit_id=52,
+                property_id=62,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=0,
+            )
+
+        self.assertTrue(post_rent_ar(402)["posted"])
+
+        result = post_commission_split(402)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_commission_configured")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=402,
+                source_status_transition="COMMISSION",
+            ).count(),
+            0,
+        )
+
+    def test_rent_ar_did_not_post_commission_split_never_called(self):
+        """Mirrors the view's own gate: post_commission_split is only ever
+        called when post_rent_ar's own result is {"posted": True}. Here we
+        assert the view-level behavior directly via sync_lease_transaction
+        rather than calling post_commission_split in isolation, since the
+        spec frames this as "no commission posting attempted", i.e. the
+        caller-side gate, not a check inside post_commission_split itself."""
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=403,
+                lease_id=43,
+                unit_id=53,
+                property_id=63,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=8,
+            )
+            # Force post_rent_ar to fail: no FinancePMCProfile resolvable for
+            # this pmc_id? No -- profile exists for pmc_id=1. Instead make
+            # amount null so post_rent_ar itself fails with missing_amount.
+            cursor.execute(
+                "UPDATE lease_leasetransaction SET amount = NULL WHERE id = %s",
+                [403],
+            )
+
+        from django.test import override_settings
+        from django.urls import reverse
+
+        with override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token"):
+            response = self.client.post(
+                reverse(
+                    "sync-lease-transaction",
+                    kwargs={"lease_transaction_id": 403},
+                ),
+                data={"lease_transaction_id": 403},
+                content_type="application/json",
+                HTTP_X_INTERNAL_TOKEN="test-internal-token",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["content"]["posting"]["rent_ar"]["posted"])
+        self.assertNotIn("commission_split", body["content"]["posting"])
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=403).count(), 0
+        )
+
+    def test_duplicate_sync_is_skipped(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=404,
+                lease_id=44,
+                unit_id=54,
+                property_id=64,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=8,
+            )
+
+        self.assertTrue(post_rent_ar(404)["posted"])
+        first = post_commission_split(404)
+        second = post_commission_split(404)
+
+        self.assertTrue(first["posted"])
+        self.assertFalse(second["posted"])
+        self.assertEqual(second["reason"], "duplicate_skip")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=404,
+                source_status_transition="COMMISSION",
+            ).count(),
+            1,
+        )
+
+    def test_owners_sum_to_100_posts_same_three_lines(self):
+        profile = self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=405,
+                lease_id=45,
+                unit_id=55,
+                property_id=65,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=8,
+            )
+            self._insert_owner(cursor, unit_id=55, ownership_percent=60)
+            self._insert_owner(cursor, unit_id=55, ownership_percent=40)
+
+        self.assertTrue(post_rent_ar(405)["posted"])
+        result = post_commission_split(405)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=405,
+            source_status_transition="COMMISSION",
+        )
+        self.assertEqual(entry.finance_pmc_profile_id, profile.id)
+
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 3)
+        expense_line = lines.get(account__name="Commission Expense")
+        ap_line = lines.get(account__name="AP — PMC Commission")
+        vat_line = lines.get(account__name="VAT Payable")
+        self.assertEqual(expense_line.debit, 840)
+        self.assertEqual(ap_line.credit, 800)
+        self.assertEqual(vat_line.credit, 40)
+
+    def test_owners_do_not_sum_to_100_fails_loudly_no_partial_post(self):
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=406,
+                lease_id=46,
+                unit_id=56,
+                property_id=66,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=8,
+            )
+            self._insert_owner(cursor, unit_id=56, ownership_percent=60)
+            self._insert_owner(cursor, unit_id=56, ownership_percent=30)
+
+        self.assertTrue(post_rent_ar(406)["posted"])
+        result = post_commission_split(406)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "invalid_ownership_split")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=406,
+                source_status_transition="COMMISSION",
+            ).count(),
+            0,
+        )
+
+    def test_zero_owner_rows_is_not_a_failure(self):
+        """A Unit with zero UnitOwner rows (matching today's actual DB
+        state) is NOT a failure -- the ownership-percent check only applies
+        when at least one UnitOwner row exists (spec Boundaries &
+        Constraints)."""
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=407,
+                lease_id=47,
+                unit_id=57,
+                property_id=67,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=8,
+            )
+            # No property_unitowner rows inserted at all.
+
+        self.assertTrue(post_rent_ar(407)["posted"])
+        result = post_commission_split(407)
+
+        self.assertTrue(result["posted"])
+
+    def test_unresolvable_pmc_posts_nothing(self):
+        # No FinancePMCProfile created at all for pmc_id=999 -- chain
+        # resolves fully but the final FinancePMCProfile lookup comes up
+        # empty. post_rent_ar itself would also fail unresolvable_pmc, so
+        # we call post_commission_split directly to isolate its own
+        # resolution-failure path.
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=408,
+                lease_id=48,
+                unit_id=58,
+                property_id=68,
+                pmc_id=999,
+                amount=10000,
+                commission_percent=8,
+            )
+
+        result = post_commission_split(408)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "unresolvable_pmc")
+
+    def test_unconfigured_chart_of_accounts_posts_nothing(self):
+        profile = self._make_profile(pmc_id=1)
+        Account.objects.filter(
+            finance_pmc_profile=profile,
+            name__in=["Commission Expense", "AP — PMC Commission", "VAT Payable"],
+        ).delete()
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=409,
+                lease_id=49,
+                unit_id=59,
+                property_id=69,
+                pmc_id=1,
+                amount=10000,
+                commission_percent=8,
+            )
+
+        self.assertTrue(post_rent_ar(409)["posted"])
+        result = post_commission_split(409)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "chart_of_accounts_not_configured")
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=409,
+                source_status_transition="COMMISSION",
+            ).count(),
+            0,
+        )

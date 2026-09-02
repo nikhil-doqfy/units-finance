@@ -103,6 +103,7 @@ from ledger.models import (
     LeaseTransactionRef,
     LedgerLine,
     PropertyRef,
+    UnitOwnerRef,
     UnitRef,
 )
 
@@ -150,6 +151,19 @@ BANK_ACCOUNT_NAME = "Bank"
 BOUNCED_CHEQUES_ACCOUNT_NAME = "Bounced Cheques"
 BANK_CHARGES_FEE_INCOME_ACCOUNT_NAME = "Bank Charges/Fees"
 VAT_PAYABLE_ACCOUNT_NAME = "VAT Payable"
+COMMISSION_EXPENSE_ACCOUNT_NAME = "Commission Expense"
+AP_PMC_COMMISSION_ACCOUNT_NAME = "AP — PMC Commission"
+
+# Story 2.7's flat UAE VAT rate, applied directly to the computed commission
+# amount -- no Charge row is ever created or read for this VAT (spec Never;
+# matches the seeded PMC's UAE-only Phase 1 scope, Design Notes).
+COMMISSION_VAT_RATE = 0.05
+
+# Story 2.7's idempotency key suffix -- parallel to post_rent_ar's own
+# CREATE_STATUS_TRANSITION, but distinguishable so the two postings never
+# collide on the same (lease_transaction_id, source_status_transition) pair
+# (spec Boundaries & Constraints).
+COMMISSION_SPLIT_TRANSITION = "COMMISSION"
 
 # Trigger statuses for Story 2.3's cheque clearing posting -- a cheque is
 # "cleared" once it reaches either of these (per the existing units-backend
@@ -1231,5 +1245,266 @@ def post_security_deposit(lease_id, lease=None):
         lease_id,
         profile.pmc_id,
         amount,
+    )
+    return {"posted": True, "reason": ""}
+
+
+"""
+Story 2.7: Owner/PMC commission split posting.
+
+`post_commission_split` posts a balanced Journal Entry (debit Commission
+Expense, credit AP — PMC Commission, credit VAT Payable) whenever a rent AR
+posting (`post_rent_ar`) has just succeeded for a `Unit` with a configured
+`Unit.commission_percent`. It is called from `sync_lease_transaction`
+immediately after a successful `post_rent_ar` result -- this story never
+runs its own independent PMC/CoA resolution failure path separately from
+`post_rent_ar`'s; it piggybacks on that success (spec Boundaries &
+Constraints, spec Never).
+
+Commission source (spec Intent, human-confirmed after investigation):
+`Unit.commission_percent` only -- `Lease.commission` is a separate,
+unrelated field and is never read here. Commission amount =
+`rent_amount * (commission_percent / 100)`; VAT is a flat 5% of the
+commission amount (UAE-only Phase 1 scope), always non-zero whenever a
+split posts -- unlike Story 2.5's conditional VAT line, this VAT Payable
+line is unconditional (Design Notes).
+
+Multi-owner split (spec Boundaries & Constraints): each `UnitOwner`
+row's post-commission net share is informational/derived only -- it does
+NOT change the Journal Entry's actual lines, since Phase 1's Chart of
+Accounts has no per-owner Account. What DOES matter structurally is the
+sum-to-100 validation: if the Unit has one or more `UnitOwnerRef` rows and
+their `ownership_percent` values don't sum to exactly 100, the post fails
+loudly (AD-15) with no partial post. Zero `UnitOwnerRef` rows (today's
+actual DB state) skips this check entirely and posts normally
+(single-PMC, no owner-split concern) -- not a failure.
+
+Idempotency key is the fixed transition suffix `(lease_transaction_id,
+"COMMISSION")` -- parallel to, but distinguishable from, post_rent_ar's own
+`CREATE-BALANCE` key, stored via the same JournalEntry columns every other
+posting function in this module uses.
+
+Cross-PMC splitting (the epics' "managing PMC differs from owning PMC"
+framing) is explicitly out of scope -- no second-PMC concept exists
+anywhere in the schema (`Property.pmc` is a single nullable FK); this is
+single-PMC-only posting, the epics' own stated fallback (spec Intent).
+"""
+
+
+def post_commission_split(lease_transaction_id, txn=None):
+    """Post the owner/PMC commission split for a just-posted rent AR entry.
+
+    Must only be called after `post_rent_ar(lease_transaction_id, ...)` has
+    itself returned `{"posted": True}` for this same lease_transaction_id
+    (spec Boundaries & Constraints, Never) -- this function does not check
+    that itself; the caller (`sync_lease_transaction`) is responsible for
+    the gate.
+
+    `txn` may be passed in by a caller that has already fetched the
+    `LeaseTransactionRef` (mirrors every other posting function's `txn`
+    param in this module) -- avoids a second, redundant query for the same
+    row. If omitted, this function fetches it itself.
+
+    Returns a dict: {"posted": bool, "reason": str} -- same shape/contract
+    as every other posting function here. Never raises for an expected
+    failure path (no commission configured, duplicate, unresolvable PMC,
+    unconfigured CoA, invalid ownership split); only a genuinely unexpected
+    DB error propagates out of the atomic block.
+    """
+    if txn is None:
+        txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
+    if txn is None:
+        logger.error(
+            "post_commission_split: no LeaseTransaction found for id=%s -- "
+            "cannot post",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "lease_transaction_not_found"}
+
+    if txn.amount is None:
+        logger.error(
+            "post_commission_split: LeaseTransaction id=%s has a null "
+            "amount -- cannot post",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "missing_amount"}
+
+    transition = COMMISSION_SPLIT_TRANSITION
+
+    if JournalEntry.objects.filter(
+        source_lease_transaction_id=lease_transaction_id,
+        source_status_transition=transition,
+    ).exists():
+        logger.info(
+            "post_commission_split: JournalEntry already exists for "
+            "lease_transaction_id=%s transition=%s -- skipping duplicate "
+            "post",
+            lease_transaction_id,
+            transition,
+        )
+        return {"posted": False, "reason": "duplicate_skip"}
+
+    # Walk the exact same PMC resolution chain post_rent_ar uses -- no new
+    # resolution mechanism (spec Boundaries & Constraints: "reuses the exact
+    # same chain").
+    lease = LeaseRef.objects.filter(pk=txn.lease_id).first()
+    if lease is None:
+        logger.error(
+            "post_commission_split: unresolvable PMC for "
+            "lease_transaction_id=%s -- no Lease found for lease_id=%s",
+            lease_transaction_id,
+            txn.lease_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    unit = UnitRef.objects.filter(pk=lease.unit_id).first()
+    if unit is None:
+        logger.error(
+            "post_commission_split: unresolvable PMC for "
+            "lease_transaction_id=%s -- no Unit found for unit_id=%s",
+            lease_transaction_id,
+            lease.unit_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    property_ = PropertyRef.objects.filter(pk=unit.parent_property_id).first()
+    if property_ is None:
+        logger.error(
+            "post_commission_split: unresolvable PMC for "
+            "lease_transaction_id=%s -- no Property found for "
+            "parent_property_id=%s",
+            lease_transaction_id,
+            unit.parent_property_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    profile = FinancePMCProfile.objects.filter(pmc_id=property_.pmc_id).first()
+    if profile is None:
+        logger.error(
+            "post_commission_split: unresolvable PMC for "
+            "lease_transaction_id=%s -- no FinancePMCProfile found for "
+            "pmc_id=%s",
+            lease_transaction_id,
+            property_.pmc_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    # Commission source: Unit.commission_percent only (spec Never -- do not
+    # read Lease.commission). Null or zero is a genuine no-op -- not every
+    # unit is PMC-managed (spec Boundaries & Constraints).
+    commission_percent = unit.commission_percent
+    if not commission_percent:
+        return {"posted": False, "reason": "no_commission_configured"}
+
+    rent_amount = txn.amount
+    commission_amount = float(rent_amount) * (float(commission_percent) / 100)
+    vat_amount = commission_amount * COMMISSION_VAT_RATE
+
+    # AD-15: validate the Unit's UnitOwner set sums to exactly 100 -- but
+    # only when at least one UnitOwnerRef row exists for this unit. Zero
+    # owners (today's actual DB state) skips this check entirely and posts
+    # normally (spec Boundaries & Constraints).
+    owner_percents = list(
+        UnitOwnerRef.objects.filter(unit_id=unit.id).values_list(
+            "ownership_percent", flat=True
+        )
+    )
+    if owner_percents:
+        owner_percent_total = sum(float(p) for p in owner_percents)
+        if abs(owner_percent_total - 100) > 1e-9:
+            logger.error(
+                "post_commission_split: invalid ownership split for "
+                "lease_transaction_id=%s unit_id=%s -- UnitOwner "
+                "ownership_percent values sum to %s, not 100 -- refusing "
+                "to post (AD-15)",
+                lease_transaction_id,
+                unit.id,
+                owner_percent_total,
+            )
+            return {"posted": False, "reason": "invalid_ownership_split"}
+
+    try:
+        commission_expense_account = Account.objects.get(
+            finance_pmc_profile=profile, name=COMMISSION_EXPENSE_ACCOUNT_NAME
+        )
+        ap_pmc_commission_account = Account.objects.get(
+            finance_pmc_profile=profile, name=AP_PMC_COMMISSION_ACCOUNT_NAME
+        )
+        vat_payable_account = Account.objects.get(
+            finance_pmc_profile=profile, name=VAT_PAYABLE_ACCOUNT_NAME
+        )
+    except Account.DoesNotExist:
+        logger.error(
+            "post_commission_split: Chart of Accounts not configured for "
+            "FinancePMCProfile pmc_id=%s (lease_transaction_id=%s) -- "
+            "expected Accounts named %r, %r and %r",
+            profile.pmc_id,
+            lease_transaction_id,
+            COMMISSION_EXPENSE_ACCOUNT_NAME,
+            AP_PMC_COMMISSION_ACCOUNT_NAME,
+            VAT_PAYABLE_ACCOUNT_NAME,
+        )
+        return {"posted": False, "reason": "chart_of_accounts_not_configured"}
+
+    # Commission Expense debits the FULL commission_amount + vat_amount as
+    # one line -- mirroring post_bounce_fee's exact precedent (AR debits
+    # fee_amount + vat_amount together while Fee Income and VAT Payable are
+    # credited separately). The spec's "debit Commission Expense 800" in
+    # the I/O matrix/Acceptance Criteria is shorthand emphasizing the
+    # commission portion of the debit; the CoA has no separate account to
+    # carry the VAT's debit side, so it must be folded into the same debit
+    # line for the entry to balance (NFR-1: debits == credits, always).
+    expense_debit_total = commission_amount + vat_amount
+
+    with transaction.atomic():
+        entry = JournalEntry.objects.create(
+            finance_pmc_profile=profile,
+            source_lease_transaction_id=lease_transaction_id,
+            source_status_transition=transition,
+        )
+
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=commission_expense_account,
+            debit=expense_debit_total,
+            credit=0,
+        )
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=ap_pmc_commission_account,
+            debit=0,
+            credit=commission_amount,
+        )
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=vat_payable_account,
+            debit=0,
+            credit=vat_amount,
+        )
+
+        debit_total = sum(line.debit for line in entry.lines.all())
+        credit_total = sum(line.credit for line in entry.lines.all())
+        if debit_total != credit_total or debit_total != expense_debit_total:
+            # Explicit if/raise balance check -- never `assert` (NFR-1).
+            # Raising here rolls back the whole atomic block.
+            raise ValueError(
+                f"post_commission_split: unbalanced entry for "
+                f"lease_transaction_id={lease_transaction_id} "
+                f"(debit={debit_total}, credit={credit_total}, "
+                f"commission_amount={commission_amount}, "
+                f"vat_amount={vat_amount})"
+            )
+
+    logger.info(
+        "post_commission_split: posted JournalEntry id=%s for "
+        "lease_transaction_id=%s (pmc_id=%s, rent_amount=%s, "
+        "commission_percent=%s, commission_amount=%s, vat_amount=%s)",
+        entry.id,
+        lease_transaction_id,
+        profile.pmc_id,
+        rent_amount,
+        commission_percent,
+        commission_amount,
+        vat_amount,
     )
     return {"posted": True, "reason": ""}

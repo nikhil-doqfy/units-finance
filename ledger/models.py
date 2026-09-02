@@ -285,12 +285,23 @@ class UnitRef(models.Model):
     """Read-only reference onto units-backend's Unit table.
 
     Next hop toward the PMC from `LeaseRef.unit_id` (Design Notes).
+
+    Story 2.7 adds `commission_percent`: the sole commission source for
+    `post_commission_split` (spec Intent -- `Lease.commission` is not read).
     """
 
     parent_property_id = models.BigIntegerField(
         null=True,
         blank=True,
         help_text="units-backend Property.id — not a cross-DB FK (next hop toward the PMC).",
+    )
+    commission_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=3,
+        null=True,
+        blank=True,
+        help_text="units-backend Unit.commission_percent -- Story 2.7's sole "
+        "commission source (spec Never: Lease.commission is not read).",
     )
 
     class Meta:
@@ -299,6 +310,36 @@ class UnitRef(models.Model):
 
     def __str__(self):
         return f"UnitRef(id={self.id}, parent_property_id={self.parent_property_id})"
+
+
+class UnitOwnerRef(models.Model):
+    """Read-only reference onto units-backend's UnitOwner table (Story 2.7).
+
+    Lets Finance read each owner's `ownership_percent` share for a Unit
+    (AD-15/AD-9) without importing units-backend's `property` app or code,
+    following the same unmanaged-model pattern as the other `*Ref` models
+    above. Field list is kept minimal -- only what
+    `post_commission_split`'s sum-to-100 validation actually needs (spec
+    Code Map).
+    """
+
+    unit_id = models.BigIntegerField(
+        help_text="units-backend Unit.id — not a cross-DB FK (AD-19 precedent)."
+    )
+    ownership_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        help_text="units-backend UnitOwner.ownership_percent -- AD-15's "
+        "sum-to-100 invariant, validated (not itself posted) by "
+        "post_commission_split.",
+    )
+
+    class Meta:
+        managed = False
+        db_table = "property_unitowner"
+
+    def __str__(self):
+        return f"UnitOwnerRef(id={self.id}, unit_id={self.unit_id}, ownership_percent={self.ownership_percent})"
 
 
 class PropertyRef(models.Model):

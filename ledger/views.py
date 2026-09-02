@@ -19,6 +19,12 @@ Story 2.6 adds `sync_lease`, a SEPARATE view parallel to
 different units-backend signal). It receives units-backend's second-ever
 signal (a `post_save` on `Lease`, not `LeaseTransaction`) and calls
 `post_security_deposit`.
+
+Story 2.7 adds `post_commission_split`, called from `sync_lease_transaction`
+immediately after `post_rent_ar` -- but ONLY when `post_rent_ar`'s own
+result is `{"posted": True}` (spec Boundaries & Constraints). Unlike
+Story 2.3-2.5's checks, this is not run unconditionally on every sync: it
+piggybacks entirely on a successful rent AR post in the same call.
 """
 from rest_framework.decorators import api_view
 
@@ -28,6 +34,7 @@ from ledger.posting import (
     post_bounce_fee,
     post_bounce_reversal,
     post_cheque_clearing,
+    post_commission_split,
     post_rent_ar,
     post_security_deposit,
 )
@@ -70,7 +77,18 @@ def sync_lease_transaction(request, lease_transaction_id):
         # Pass the already-fetched txn through so neither posting function
         # re-queries the same row a second time.
         if txn.cheque_type == RENT_CHEQUE:
-            posting_results["rent_ar"] = post_rent_ar(lease_transaction_id, txn=txn)
+            rent_ar_result = post_rent_ar(lease_transaction_id, txn=txn)
+            posting_results["rent_ar"] = rent_ar_result
+
+            # Story 2.7: runs immediately after a successful rent AR post,
+            # same gate (cheque_type == RENT_CHEQUE), only when post_rent_ar
+            # itself posted -- this story never runs its own independent
+            # PMC/CoA resolution failure path separately from post_rent_ar's
+            # (spec Boundaries & Constraints, Never).
+            if rent_ar_result.get("posted"):
+                posting_results["commission_split"] = post_commission_split(
+                    lease_transaction_id, txn=txn
+                )
 
         # Deliberately NOT gated on cheque_type (Spec Change Log) -- runs on
         # every sync regardless of cheque_type; the existing prior-
