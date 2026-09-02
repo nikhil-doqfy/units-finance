@@ -79,3 +79,51 @@ def compute_trial_balance(finance_pmc_profile, start_date, end_date):
         "accounts": account_rows,
         "balanced": sum_debit == sum_credit,
     }
+
+
+def compute_profit_loss(finance_pmc_profile, start_date, end_date):
+    """Story 3.3: Profit & Loss report aggregation.
+
+    Deliberately calls `compute_trial_balance` and filters/transforms its
+    `accounts` list -- never re-derives the aggregation query independently
+    (spec Boundaries & Constraints, Never) -- so the P&L's net figure is
+    "independently recomputable from the Trial Balance output" (FR-11) by
+    construction, not just by coincidence (spec Design Notes).
+
+    Per-account contribution follows standard double-entry convention
+    (spec Boundaries & Constraints / Design Notes): an `Income` account is
+    credit-normal (`total_credit - total_debit`), an `Expense` account is
+    debit-normal (`total_debit - total_credit`) -- matching every existing
+    posting function's own convention (e.g. `post_rent_ar` credits Rent
+    Income, `post_commission_split`/`post_bounce_fee` debit Commission
+    Expense/Bank Charges-Fees).
+
+    Returns a dict: `{"income_accounts": [...], "expense_accounts": [...],
+    "net_profit_loss": Decimal}`, where each account dict has `id`, `name`,
+    `account_type`, `total_debit`, `total_credit`, `contribution`.
+    """
+    trial_balance = compute_trial_balance(finance_pmc_profile, start_date, end_date)
+
+    income_accounts = []
+    expense_accounts = []
+
+    for account in trial_balance["accounts"]:
+        if account["account_type"] == Account.INCOME:
+            contribution = account["total_credit"] - account["total_debit"]
+            income_accounts.append({**account, "contribution": contribution})
+        elif account["account_type"] == Account.EXPENSE:
+            contribution = account["total_debit"] - account["total_credit"]
+            expense_accounts.append({**account, "contribution": contribution})
+
+    total_income = sum(
+        (row["contribution"] for row in income_accounts), start=0
+    )
+    total_expense = sum(
+        (row["contribution"] for row in expense_accounts), start=0
+    )
+
+    return {
+        "income_accounts": income_accounts,
+        "expense_accounts": expense_accounts,
+        "net_profit_loss": total_income - total_expense,
+    }

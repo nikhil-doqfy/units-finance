@@ -43,7 +43,7 @@ from ledger.posting import (
     post_rent_ar,
     post_security_deposit,
 )
-from ledger.reports import compute_trial_balance
+from ledger.reports import compute_profit_loss, compute_trial_balance
 from ledger.response_envelope import prepare_response
 
 
@@ -273,5 +273,99 @@ def trial_balance_report(request):
             "balanced": trial_balance["balanced"],
         },
         message="Trial Balance report generated",
+        status=200,
+    )
+
+
+@api_view(["GET"])
+def profit_loss_report(request):
+    """Story 3.3: `GET /reports/profit-loss`.
+
+    `pmc_id`, `start_date`, `end_date` are required query params. Reuses the
+    exact same request-handling sequence as `trial_balance_report` (spec
+    Boundaries & Constraints):
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id`/`start_date`/`end_date` (including the
+         inverted-range check) -- 400 on failure, before any query runs.
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Aggregate via `compute_profit_loss` (which itself calls
+         `compute_trial_balance` -- never re-derives the aggregation query
+         independently, spec Never) and respond.
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+    start_date_str = request.query_params.get("start_date")
+    end_date_str = request.query_params.get("end_date")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    start_date = _parse_iso_date(start_date_str)
+    end_date = _parse_iso_date(end_date_str)
+
+    if pmc_id is None or start_date is None or end_date is None:
+        return prepare_response(
+            content={
+                "pmc_id": raw_pmc_id,
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+            },
+            message="pmc_id, start_date, and end_date are required "
+            "(start_date/end_date must be valid ISO 8601 dates)",
+            status=400,
+        )
+
+    if start_date > end_date:
+        return prepare_response(
+            content={
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+            },
+            message="start_date must not be after end_date",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view this PMC's reports",
+            status=403,
+        )
+
+    profit_loss = compute_profit_loss(finance_pmc_profile, start_date, end_date)
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "income_accounts": profit_loss["income_accounts"],
+            "expense_accounts": profit_loss["expense_accounts"],
+            "net_profit_loss": profit_loss["net_profit_loss"],
+        },
+        message="Profit & Loss report generated",
         status=200,
     )
