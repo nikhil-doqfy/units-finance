@@ -193,6 +193,13 @@ class LeaseTransactionRef(models.Model):
     only when `cheque_type == OTHER_CHARGE`) is how Finance detects an
     `OTHER_CHARGE` transaction actually carries a fee to post against (spec
     Code Map).
+
+    Story 3.5 adds `cheque_date`: the real units-backend column
+    (`DateTimeField(null=True, blank=True)`, confirmed by reading
+    `lease/models.py:144`), used by `compute_ageing` for the days-overdue
+    computation (normalized to `.date()` before subtraction, spec Boundaries
+    & Constraints) -- following the `created` field's existing precedent
+    above, same type, same nullability.
     """
 
     lease_id = models.BigIntegerField(
@@ -214,6 +221,13 @@ class LeaseTransactionRef(models.Model):
         help_text="units-backend Charge.id (LeaseTransaction.charge FK) — set "
         "only when cheque_type == OTHER_CHARGE; not a cross-DB FK (AD-19 "
         "precedent).",
+    )
+    cheque_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="units-backend LeaseTransaction.cheque_date -- Story 3.5's "
+        "Ageing report days-overdue basis; normalize to .date() before "
+        "subtracting from today (spec Boundaries & Constraints).",
     )
 
     class Meta:

@@ -43,8 +43,21 @@ from ledger.posting import (
     post_rent_ar,
     post_security_deposit,
 )
-from ledger.reports import compute_balance_sheet, compute_profit_loss, compute_trial_balance
+from ledger.reports import (
+    compute_ageing,
+    compute_balance_sheet,
+    compute_profit_loss,
+    compute_trial_balance,
+)
 from ledger.response_envelope import prepare_response
+
+# Story 3.5's default page size (spec Boundaries & Constraints: "page_size
+# (optional, default a fixed constant e.g. 25)").
+AGEING_DEFAULT_PAGE_SIZE = 25
+# Upper bound on caller-supplied page_size -- prevents a single request from
+# forcing the full per-row Ledger-balance computation onto one page (review
+# finding; unbounded page_size was not covered by the spec).
+AGEING_MAX_PAGE_SIZE = 100
 
 
 @api_view(["POST"])
@@ -453,4 +466,99 @@ def balance_sheet_report(request):
         },
         message="Balance Sheet report generated",
         status=200,
+    )
+
+
+@api_view(["GET"])
+def ageing_report(request):
+    """Story 3.5: `GET /reports/ageing`.
+
+    `pmc_id` is required; `page` (default 1) and `page_size` (default
+    `AGEING_DEFAULT_PAGE_SIZE`) are optional -- no date param at all, since
+    Ageing is always "as of today" (spec Boundaries & Constraints, FR-13).
+    Same auth -> parse/validate -> resolve-profile -> scope-check sequence
+    as Stories 3.2-3.4:
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id` (and `page`/`page_size`, if given) -- 400
+         on failure, before any query runs.
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Aggregate/paginate via `compute_ageing` and respond -- `content` is
+         the row list, `pagination` is a sibling top-level key, never
+         nested inside `content` (Structural Seed, spec Never).
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+    raw_page = request.query_params.get("page", "1")
+    raw_page_size = request.query_params.get("page_size", str(AGEING_DEFAULT_PAGE_SIZE))
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        page = None
+
+    try:
+        page_size = int(raw_page_size)
+    except (TypeError, ValueError):
+        page_size = None
+
+    if (
+        pmc_id is None
+        or page is None
+        or page_size is None
+        or page < 1
+        or page_size < 1
+        or page_size > AGEING_MAX_PAGE_SIZE
+    ):
+        return prepare_response(
+            content={
+                "pmc_id": raw_pmc_id,
+                "page": raw_page,
+                "page_size": raw_page_size,
+            },
+            message="pmc_id is required (page must be a positive integer; "
+            f"page_size must be a positive integer up to {AGEING_MAX_PAGE_SIZE})",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view this PMC's reports",
+            status=403,
+        )
+
+    ageing = compute_ageing(finance_pmc_profile, page=page, page_size=page_size)
+
+    return prepare_response(
+        content=ageing["content"],
+        message="Ageing report generated",
+        status=200,
+        paginator=ageing["page_obj"],
+        total_records=ageing["total_records"],
     )
