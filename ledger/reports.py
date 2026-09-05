@@ -25,7 +25,14 @@ from django.db.models import DecimalField, Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from ledger.models import Account, LedgerLine, LeaseTransactionRef, LeaseRef, UnitRef, PropertyRef
+from ledger.models import (
+    Account,
+    LedgerLine,
+    LeaseTransactionRef,
+    LeaseRef,
+    UnitRef,
+    PropertyRef,
+)
 from ledger.posting import AR_TENANTS_ACCOUNT_NAME
 
 
@@ -271,6 +278,12 @@ def compute_ageing(finance_pmc_profile, page=1, page_size=25):
             cheque_date__isnull=False,
         )
         .exclude(status="REALIZED")
+        # `created` lives only on units-backend's parent `Documents` table
+        # (MTI: `LeaseTransaction(Documents)`), not on `lease_leasetransaction`
+        # itself -- deferred here since Ageing never reads it, and selecting
+        # it would 500 with `column lease_leasetransaction.created does not
+        # exist` (confirmed against the live table's actual columns).
+        .defer("created")
         .order_by("cheque_date", "id")
     )
 
@@ -334,4 +347,158 @@ def compute_ageing(finance_pmc_profile, page=1, page_size=25):
         "content": list(page_obj.object_list),
         "page_obj": page_obj,
         "total_records": paginator.count,
+    }
+
+
+# Standard double-entry normal-balance sign per Account type, matching the
+# convention already established independently in compute_profit_loss
+# (Income/Expense) and compute_balance_sheet (Asset/Liability) above --
+# Equity is included for completeness/symmetry only: no real Account row is
+# ever seeded or posted to with account_type=Equity in Phase 1 (Equity is
+# always a derived Retained Earnings figure, never a posted Account, per
+# compute_balance_sheet's own docstring), so this branch is expected to be
+# unreachable in practice, not a new posting path.
+_CREDIT_NORMAL_ACCOUNT_TYPES = {Account.LIABILITY, Account.INCOME, Account.EQUITY}
+
+
+def compute_chart_of_accounts(finance_pmc_profile):
+    """FFR-13 (frontend-prd.md §4.4): the standalone Chart of Accounts view's
+    backend companion (AD-6).
+
+    Returns every seeded `Account` for `finance_pmc_profile` (FR-3's fixed
+    7+ row set) with its current, since-inception running balance -- a
+    cumulative window from `finance_pmc_profile.created.date()` through
+    today, following the exact same since-inception convention
+    `compute_balance_sheet` already established above (Design Notes
+    precedent), rather than a new windowing rule invented for this view.
+
+    Sign convention matches every other report function in this module:
+    Asset/Expense accounts are debit-normal (`total_debit - total_credit`),
+    Liability/Income/Equity accounts are credit-normal
+    (`total_credit - total_debit`) -- reusing `compute_trial_balance`'s raw
+    per-account debit/credit sums rather than re-deriving the aggregation
+    query (same reuse discipline as `compute_profit_loss`/
+    `compute_balance_sheet`).
+
+    Returns a dict: `{"accounts": [...]}`, where each account dict has
+    `id`, `name`, `account_type`, `balance` -- deliberately a smaller shape
+    than Trial Balance's row (no separate `total_debit`/`total_credit`
+    exposed), since this view's job is "what Accounts exist and what do
+    they currently hold," not a period debit/credit breakdown (that's
+    Trial Balance's job, and remains reachable via the existing endpoint
+    for the same PMC).
+    """
+    since_inception = finance_pmc_profile.created.date()
+    today = timezone.localdate()
+
+    trial_balance = compute_trial_balance(finance_pmc_profile, since_inception, today)
+
+    accounts = [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "account_type": row["account_type"],
+            "balance": (
+                row["total_credit"] - row["total_debit"]
+                if row["account_type"] in _CREDIT_NORMAL_ACCOUNT_TYPES
+                else row["total_debit"] - row["total_credit"]
+            ),
+        }
+        for row in trial_balance["accounts"]
+    ]
+
+    return {"accounts": accounts}
+
+
+def compute_account_ledger_lines(account, start_date, end_date, page=1, page_size=25):
+    """FFR-14/FFR-15 (frontend-prd.md §4.4): the per-Account Ledger
+    drill-down's backend companion (AD-6).
+
+    Returns the individual `LedgerLine` rows posted to `account` within
+    `[start_date, end_date]` (inclusive both ends, same window convention
+    as `compute_trial_balance` above), ordered oldest-to-newest, each
+    annotated with a running balance -- so the page's displayed rows sum to
+    exactly the same figure Trial Balance would show for this Account and
+    date range (frontend-prd.md FFR-14's decomposition guarantee), computed
+    here via the same debit/credit sign convention as
+    `compute_chart_of_accounts` above (not re-derived independently).
+
+    Every row also carries `source_lease_transaction_id` (traceability,
+    AD-14) and, when the parent `JournalEntry` is a reversal or was itself
+    reversed, `reversed_journal_entry_id` / `reversing_entry_ids` -- the
+    bidirectional linkage FFR-15 requires. `reversed_journal_entry_id` is
+    read directly off the FK already on `JournalEntry` (AD-16); the reverse
+    direction (a row's reversal, if any) has no direct FK to read, so it's
+    resolved via `JournalEntry.reversing_entries` (the FK's own
+    `related_name`, AD-16) -- never a new query pattern invented for this
+    story, just the existing relation read from its other side.
+
+    Paginated via Django's `Paginator`, matching Ageing's existing
+    pagination convention (Structural Seed precedent) -- a Ledger
+    drill-down is a naturally growing list, unlike Trial Balance/P&L/
+    Balance Sheet's whole-snapshot shape.
+
+    Returns a dict: `{"content": [...], "page_obj": <Page>,
+    "total_records": int, "account_balance": Decimal}`, where
+    `account_balance` is the account's total balance for the same window
+    (for the page to display against the sum of visible rows) and each
+    `content` row is `{ledger_line_id, journal_entry_id, posted_at,
+    source_lease_transaction_id, source_status_transition, debit, credit,
+    running_balance, reversed_journal_entry_id, reversing_entry_ids}`.
+    """
+    period_start = timezone.make_aware(datetime.combine(start_date, time.min))
+    period_end = timezone.make_aware(datetime.combine(end_date, time.max))
+
+    is_credit_normal = account.account_type in _CREDIT_NORMAL_ACCOUNT_TYPES
+
+    lines = list(
+        LedgerLine.objects.filter(
+            account=account,
+            journal_entry__posted_at__gte=period_start,
+            journal_entry__posted_at__lte=period_end,
+        )
+        .select_related("journal_entry")
+        .prefetch_related("journal_entry__reversing_entries")
+        .order_by("journal_entry__posted_at", "id")
+    )
+
+    rows = []
+    running_balance = 0
+    for line in lines:
+        signed_amount = (
+            (line.credit - line.debit) if is_credit_normal else (line.debit - line.credit)
+        )
+        running_balance += signed_amount
+
+        journal_entry = line.journal_entry
+        reversing_entry_ids = [
+            entry.id for entry in journal_entry.reversing_entries.all()
+        ]
+
+        rows.append(
+            {
+                "ledger_line_id": line.id,
+                "journal_entry_id": journal_entry.id,
+                "posted_at": journal_entry.posted_at.isoformat(),
+                "source_lease_transaction_id": journal_entry.source_lease_transaction_id,
+                "source_status_transition": journal_entry.source_status_transition,
+                "debit": line.debit,
+                "credit": line.credit,
+                "running_balance": running_balance,
+                "reversed_journal_entry_id": journal_entry.reversed_journal_entry_id,
+                "reversing_entry_ids": reversing_entry_ids,
+            }
+        )
+
+    paginator = Paginator(rows, page_size)
+    # Matches compute_ageing's existing clamp convention exactly (Django's
+    # Paginator always reports num_pages >= 1, even for an empty list).
+    page = max(1, min(page, paginator.num_pages))
+    page_obj = paginator.page(page)
+
+    return {
+        "content": list(page_obj.object_list),
+        "page_obj": page_obj,
+        "total_records": paginator.count,
+        "account_balance": running_balance,
     }

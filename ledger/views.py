@@ -33,8 +33,10 @@ from rest_framework.decorators import api_view
 from ledger.auth import authenticate_reporting_request
 from ledger.decorators import require_internal_token
 from ledger.models import (
+    Account,
     BankStatementMatch,
     FinancePMCProfile,
+    JournalEntry,
     LeaseRef,
     LeaseTransactionRef,
 )
@@ -56,12 +58,21 @@ from ledger.reconciliation import (
     import_bank_statement_csv,
 )
 from ledger.reports import (
+    compute_account_ledger_lines,
     compute_ageing,
     compute_balance_sheet,
+    compute_chart_of_accounts,
     compute_profit_loss,
     compute_trial_balance,
 )
 from ledger.response_envelope import prepare_response
+
+# frontend-prd.md FFR-14/FFR-15's drill-down page size, sibling to Ageing's
+# existing AGEING_DEFAULT_PAGE_SIZE/AGEING_MAX_PAGE_SIZE pair (Structural
+# Seed precedent) -- a Ledger drill-down is the other naturally-growing list
+# in this API, so it paginates the same way.
+LEDGER_LINES_DEFAULT_PAGE_SIZE = 25
+LEDGER_LINES_MAX_PAGE_SIZE = 100
 
 # Story 3.5's default page size (spec Boundaries & Constraints: "page_size
 # (optional, default a fixed constant e.g. 25)").
@@ -737,24 +748,30 @@ def suggested_matches(request):
 
 @api_view(["POST"])
 def apply_bank_statement_match(request):
-    """Story 4.2: `POST /reconciliation/match` (FR-15).
+    """Story 4.2 / AD-16: `POST /reconciliation/match` (FR-15/FFR-11).
 
     `pmc_id`, `bank_statement_line_id`, `journal_entry_id`, `action`
-    (`confirm`|`reject`) are all required. Same auth -> parse/validate ->
-    resolve-profile -> scope-check sequence as every other Finance endpoint
-    (spec Always), then delegates the confirm/reject state transition to
+    (`confirm`|`reject`|`unreconcile`) are all required. Same auth ->
+    parse/validate -> resolve-profile -> scope-check sequence as every other
+    Finance endpoint (spec Always), then delegates the state transition to
     `apply_match_decision` (spec Code Map), translating its
     `BankStatementMatchError.status` into the response:
       1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
          before any query runs.
       2. Parse/validate `pmc_id`/`bank_statement_line_id`/
          `journal_entry_id`/`action` -- 400 on failure, before any query
-         runs (`action` must be exactly `confirm` or `reject`).
+         runs (`action` must be exactly `confirm`, `reject`, or
+         `unreconcile`).
       3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
       4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
          requested `pmc_id` is not in the caller's reachable PMCs.
       5. Delegate to `apply_match_decision` -- 404/409 on its own
-         validation failures, 200 on success.
+         validation failures, 200 on success. `unreconcile` only succeeds
+         against a currently-`confirmed` pair (409 otherwise), flips the
+         `BankStatementMatch` row to `unreconciled` and frees
+         `bank_statement_line.reconciled` back to `False`, so both sides
+         reappear in the open queue (FFR-11) with no separate endpoint
+         needed.
     """
     user_profile_ref, reason = authenticate_reporting_request(request)
     if user_profile_ref is None:
@@ -793,6 +810,7 @@ def apply_bank_statement_match(request):
     action_map = {
         "confirm": BankStatementMatch.CONFIRMED,
         "reject": BankStatementMatch.REJECTED,
+        "unreconcile": BankStatementMatch.UNRECONCILED,
     }
 
     if (
@@ -809,7 +827,8 @@ def apply_bank_statement_match(request):
                 "action": action,
             },
             message="pmc_id, bank_statement_line_id, journal_entry_id, and "
-            "a valid action ('confirm' or 'reject') are required",
+            "a valid action ('confirm', 'reject', or 'unreconcile') are "
+            "required",
             status=400,
         )
 
@@ -855,5 +874,312 @@ def apply_bank_statement_match(request):
             "status": result["status"],
         },
         message="Match decision applied",
+        status=200,
+    )
+
+
+@api_view(["GET"])
+def chart_of_accounts(request):
+    """AD-6 / frontend-prd.md FFR-13: `GET /accounts`.
+
+    The Chart of Accounts view's backend companion, closing the PRD gap
+    that no endpoint returns raw `Account` rows on their own (only nested
+    inside Trial Balance's response). `pmc_id` is the only required query
+    param -- there is no date range: this view always reflects each
+    Account's current, since-inception balance (spec Design Notes, matching
+    `compute_chart_of_accounts`'s own since-inception convention).
+
+    Same auth -> parse/validate -> resolve-profile -> scope-check sequence
+    as every other Finance reporting endpoint (spec Always):
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id` -- 400 on failure, before any query runs.
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Aggregate via `compute_chart_of_accounts` and respond -- returned
+         whole, never paginated (a fixed, small CoA is a snapshot document,
+         same Structural Seed rule as Trial Balance/P&L/Balance Sheet).
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    if pmc_id is None:
+        return prepare_response(
+            content={"pmc_id": raw_pmc_id},
+            message="pmc_id is required",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view this PMC's Chart of Accounts",
+            status=403,
+        )
+
+    result = compute_chart_of_accounts(finance_pmc_profile)
+
+    return prepare_response(
+        content={"pmc_id": pmc_id, "accounts": result["accounts"]},
+        message="Chart of Accounts generated",
+        status=200,
+    )
+
+
+@api_view(["GET"])
+def account_ledger_lines(request, account_id):
+    """AD-6 / frontend-prd.md FFR-14/FFR-15: `GET /accounts/<pk>/ledger-lines`.
+
+    The per-Account Ledger drill-down's backend companion, closing the PRD
+    gap that no endpoint exposes raw `LedgerLine` rows -- only report-level
+    aggregates. `pmc_id`, `start_date`, `end_date` are required query
+    params (same date-range shape as Trial Balance, spec Design Notes:
+    this view's whole point is to let a caller decompose exactly the
+    figure Trial Balance showed for the same Account/range); `page`/
+    `page_size` are optional, following Ageing's existing pagination
+    convention (Structural Seed).
+
+    Same auth -> parse/validate -> resolve-profile -> scope-check sequence
+    as every other Finance reporting endpoint (spec Always), with one
+    additional step particular to this view: resolving `account_id` (the
+    URL path segment) to a real `Account` row scoped to the *same*
+    `finance_pmc_profile` the `pmc_id` query param resolved -- a 404 if
+    `account_id` doesn't exist, or exists but belongs to a different PMC's
+    profile (never leaking cross-PMC Account existence via a 403 vs 404
+    distinction, spec Never):
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id`/`start_date`/`end_date` (and `page`/
+         `page_size`, if given) -- 400 on failure, before any query runs.
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Resolve `account_id` scoped to that same profile -- 404 if no such
+         Account exists for this PMC.
+      6. Aggregate/paginate via `compute_account_ledger_lines` and respond
+         -- `content` is the row list, `pagination` is a sibling top-level
+         key, never nested inside `content` (Structural Seed, spec Never).
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+    start_date_str = request.query_params.get("start_date")
+    end_date_str = request.query_params.get("end_date")
+    raw_page = request.query_params.get("page", "1")
+    raw_page_size = request.query_params.get(
+        "page_size", str(LEDGER_LINES_DEFAULT_PAGE_SIZE)
+    )
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    start_date = _parse_iso_date(start_date_str)
+    end_date = _parse_iso_date(end_date_str)
+
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        page = None
+
+    try:
+        page_size = int(raw_page_size)
+    except (TypeError, ValueError):
+        page_size = None
+
+    if (
+        pmc_id is None
+        or start_date is None
+        or end_date is None
+        or page is None
+        or page_size is None
+        or page < 1
+        or page_size < 1
+        or page_size > LEDGER_LINES_MAX_PAGE_SIZE
+    ):
+        return prepare_response(
+            content={
+                "pmc_id": raw_pmc_id,
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+                "page": raw_page,
+                "page_size": raw_page_size,
+            },
+            message="pmc_id, start_date, and end_date are required "
+            "(start_date/end_date must be valid ISO 8601 dates; page must "
+            "be a positive integer; page_size must be a positive integer "
+            f"up to {LEDGER_LINES_MAX_PAGE_SIZE})",
+            status=400,
+        )
+
+    if start_date > end_date:
+        return prepare_response(
+            content={
+                "start_date": start_date_str,
+                "end_date": end_date_str,
+            },
+            message="start_date must not be after end_date",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view this PMC's Ledger",
+            status=403,
+        )
+
+    account = Account.objects.filter(
+        pk=account_id, finance_pmc_profile=finance_pmc_profile
+    ).first()
+    if account is None:
+        return prepare_response(
+            content={"account_id": account_id, "pmc_id": pmc_id},
+            message="No Account exists for the given account_id and pmc_id",
+            status=404,
+        )
+
+    result = compute_account_ledger_lines(
+        account, start_date, end_date, page=page, page_size=page_size
+    )
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "account_id": account.id,
+            "account_name": account.name,
+            "account_type": account.account_type,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "account_balance": result["account_balance"],
+            "lines": result["content"],
+        },
+        message="Account Ledger lines retrieved",
+        status=200,
+        paginator=result["page_obj"],
+        total_records=result["total_records"],
+    )
+
+
+NOT_ACTIVATED = "not_activated"
+ACTIVATED_EMPTY = "activated_empty"
+ACTIVATED = "activated"
+
+
+@api_view(["GET"])
+def finance_pmc_profile_status(request, pmc_id):
+    """AD-6 / frontend-prd.md FFR-3: `GET /finance-pmc-profile/<pmc_id>/status`.
+
+    The activation-status signal AD-3's frontend route resolver depends on
+    (`route.data['financeActivation']`) -- closes the last open item from
+    AD-6's original gap list: distinguishing "no FinancePMCProfile exists
+    for this PMC" (`not_activated`) from "profile exists, zero data"
+    (`activated_empty`) from "profile exists, has activity"
+    (`activated`), a distinction no existing endpoint could make since
+    every one of them 404s identically for an unactivated PMC.
+
+    Deliberately always a normal 200 (spec Always/Never, per AD-6): a
+    reachable-but-unactivated PMC is not an error condition, so `content`
+    carries the 3-state string directly rather than the caller having to
+    infer "not activated" from a 404 the way every other Finance endpoint's
+    404 actually does mean "this specific id doesn't exist." Auth and PMC
+    reachability are still checked before revealing this status (never
+    leaking whether a PMC is Finance-activated to a caller who cannot
+    reach that PMC at all):
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id` (URL path segment) -- 400 on failure.
+      3. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs. Run
+         BEFORE resolving `FinancePMCProfile` (unlike every other Finance
+         endpoint, which resolves the profile first) specifically so an
+         unreachable pmc_id never distinguishes "PMC doesn't exist" from
+         "PMC exists but isn't Finance-activated" via timing/response-shape
+         differences -- both cases get the identical 403.
+      4. Resolve `FinancePMCProfile` by `pmc_id` -- absence means
+         `not_activated`, never a 404, per spec Always.
+      5. If a profile exists, `activated_empty` vs `activated` is decided
+         by whether any `JournalEntry` has ever been posted for it
+         (`JournalEntry.objects.filter(finance_pmc_profile=...).exists()`)
+         -- the same "has real Ledger activity" signal every report
+         function already treats as the difference between a snapshot with
+         real numbers and an all-zeros degenerate result (spec Design
+         Notes, matching `compute_balance_sheet`'s own precedent for an
+         empty-window result being a valid, non-error degenerate case).
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view this PMC's Finance status",
+            status=403,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id, "status": NOT_ACTIVATED},
+            message="Finance is not yet activated for this PMC",
+            status=200,
+        )
+
+    has_activity = JournalEntry.objects.filter(
+        finance_pmc_profile=finance_pmc_profile
+    ).exists()
+    status_value = ACTIVATED if has_activity else ACTIVATED_EMPTY
+
+    return prepare_response(
+        content={"pmc_id": pmc_id, "status": status_value},
+        message="Finance activation status resolved",
         status=200,
     )

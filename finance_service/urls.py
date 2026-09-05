@@ -3,10 +3,13 @@ from django.contrib import admin
 from django.urls import path
 
 from ledger.views import (
+    account_ledger_lines,
     ageing_report,
     apply_bank_statement_match,
     balance_sheet_report,
     bank_statement_import,
+    chart_of_accounts,
+    finance_pmc_profile_status,
     profit_loss_report,
     suggested_matches,
     sync_lease,
@@ -132,5 +135,44 @@ urlpatterns = [
         'reconciliation/match',
         apply_bank_statement_match,
         name='apply-bank-statement-match-no-slash',
+    ),
+    # AD-6 / frontend-prd.md FFR-13: Chart of Accounts -- trailing-slash +
+    # no-slash pair, matching the established route-pair convention above
+    # (spec Code Map).
+    path(
+        'accounts/',
+        chart_of_accounts,
+        name='chart-of-accounts',
+    ),
+    path(
+        'accounts',
+        chart_of_accounts,
+        name='chart-of-accounts-no-slash',
+    ),
+    # AD-6 / frontend-prd.md FFR-14/FFR-15: per-Account Ledger drill-down --
+    # trailing-slash + no-slash pair, matching the established route-pair
+    # convention above (spec Code Map).
+    path(
+        'accounts/<int:account_id>/ledger-lines/',
+        account_ledger_lines,
+        name='account-ledger-lines',
+    ),
+    path(
+        'accounts/<int:account_id>/ledger-lines',
+        account_ledger_lines,
+        name='account-ledger-lines-no-slash',
+    ),
+    # AD-6 / frontend-prd.md FFR-3: Finance-PMC-activation status signal --
+    # trailing-slash + no-slash pair, matching the established route-pair
+    # convention above (spec Code Map).
+    path(
+        'finance-pmc-profile/<int:pmc_id>/status/',
+        finance_pmc_profile_status,
+        name='finance-pmc-profile-status',
+    ),
+    path(
+        'finance-pmc-profile/<int:pmc_id>/status',
+        finance_pmc_profile_status,
+        name='finance-pmc-profile-status-no-slash',
     ),
 ]

@@ -272,10 +272,12 @@ def apply_match_decision(
         return _confirm_match(bank_statement_line, journal_entry)
     elif action == BankStatementMatch.REJECTED:
         return _reject_match(bank_statement_line, journal_entry)
+    elif action == BankStatementMatch.UNRECONCILED:
+        return _unreconcile_match(bank_statement_line, journal_entry)
 
-    # The view validates `action` in {"confirm", "reject"} before calling
-    # this function (spec Always: 400 on invalid action) -- this branch is
-    # unreachable in practice, kept only as a defensive guard.
+    # The view validates `action` in {"confirm", "reject", "unreconcile"}
+    # before calling this function (spec Always: 400 on invalid action) --
+    # this branch is unreachable in practice, kept only as a defensive guard.
     raise BankStatementMatchError(f"Unsupported action '{action}'", status=400)
 
 
@@ -369,3 +371,40 @@ def _reject_match(bank_statement_line, journal_entry):
 
     # Neither side's reconciled flag changes (spec Always).
     return {"status": "rejected", "created": existing_pair_match is None}
+
+
+def _unreconcile_match(bank_statement_line, journal_entry):
+    """AD-16: reverse a previously confirmed match, returning both sides to
+    the open queue (FFR-11).
+
+    Mirrors `_confirm_match`'s own logic in reverse: flips the
+    `BankStatementMatch` row to `UNRECONCILED` (a distinct terminal state
+    from `REJECTED` -- this pair really was matched once, unlike a rejected
+    suggestion that never was) and frees `bank_statement_line.reconciled`
+    back to `False` so it re-enters `find_suggested_matches`'/the manual
+    entry-picker's unreconciled pool immediately. The `journal_entry` side
+    has no equivalent boolean flag to flip -- its "unreconciled" status is
+    always derived at query time via `_unreconciled_bank_journal_entries`'s
+    exclusion of `CONFIRMED`-status matches, so flipping this row off
+    `CONFIRMED` is sufficient to free it too, with no second write needed.
+    """
+    from ledger.models import BankStatementMatch
+
+    existing_pair_match = BankStatementMatch.objects.filter(
+        bank_statement_line=bank_statement_line, journal_entry=journal_entry
+    ).first()
+
+    if existing_pair_match is None or existing_pair_match.status != BankStatementMatch.CONFIRMED:
+        raise BankStatementMatchError(
+            "This pair is not currently confirmed; only a confirmed match "
+            "can be un-reconciled",
+            status=409,
+        )
+
+    with transaction.atomic():
+        existing_pair_match.status = BankStatementMatch.UNRECONCILED
+        existing_pair_match.save(update_fields=["status", "modified"])
+        bank_statement_line.reconciled = False
+        bank_statement_line.save(update_fields=["reconciled", "modified"])
+
+    return {"status": "unreconciled", "created": False}

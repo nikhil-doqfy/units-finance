@@ -244,11 +244,13 @@ class BankStatementMatch(models.Model):
     SUGGESTED = "suggested"
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
+    UNRECONCILED = "unreconciled"
 
     STATUS_CHOICES = [
         (SUGGESTED, "Suggested"),
         (CONFIRMED, "Confirmed"),
         (REJECTED, "Rejected"),
+        (UNRECONCILED, "Unreconciled"),
     ]
 
     bank_statement_line = models.ForeignKey(
@@ -303,8 +305,19 @@ class LeaseTransactionRef(models.Model):
     computation (normalized to `.date()` before subtraction, spec Boundaries
     & Constraints) -- following the `created` field's existing precedent
     above, same type, same nullability.
+
+    `id` is declared explicitly, `db_column="documents_ptr_id"`: units-backend's
+    `LeaseTransaction(Documents)` is Django multi-table inheritance, so its
+    real primary-key column is `documents_ptr_id`, not `id` -- confirmed via
+    `information_schema.columns` against the live `lease_leasetransaction`
+    table. Without this override Django assumes an implicit `id` AutoField
+    that doesn't exist on this table, and every query 500s with
+    `psycopg2.errors.UndefinedColumn: column lease_leasetransaction.id does
+    not exist` -- this broke every real lease-transaction sync
+    (`sync_lease_transaction`), not just a hypothetical case.
     """
 
+    id = models.BigIntegerField(primary_key=True, db_column="documents_ptr_id")
     lease_id = models.BigIntegerField(
         help_text="units-backend Lease.id — not a cross-DB FK (next hop toward the PMC)."
     )

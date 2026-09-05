@@ -322,7 +322,7 @@ class SyncLeaseTransactionEndpointTests(TestCase):
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS lease_leasetransaction (
-                    id BIGSERIAL PRIMARY KEY,
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
                     lease_id BIGINT NOT NULL,
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
@@ -518,7 +518,7 @@ class PostRentArTests(TestCase):
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS lease_leasetransaction (
-                    id BIGSERIAL PRIMARY KEY,
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
                     lease_id BIGINT NOT NULL,
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
@@ -598,7 +598,7 @@ class PostRentArTests(TestCase):
         cursor.execute(
             """
             INSERT INTO lease_leasetransaction
-                (id, lease_id, amount, cheque_type, payment_type, status)
+                (documents_ptr_id, lease_id, amount, cheque_type, payment_type, status)
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
             [txn_id, lease_id, amount, cheque_type, "CHEQUE", status],
@@ -834,7 +834,7 @@ class PostChequeClearingTests(TestCase):
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS lease_leasetransaction (
-                    id BIGSERIAL PRIMARY KEY,
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
                     lease_id BIGINT NOT NULL,
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
@@ -909,7 +909,7 @@ class PostChequeClearingTests(TestCase):
         cursor.execute(
             """
             INSERT INTO lease_leasetransaction
-                (id, lease_id, amount, cheque_type, payment_type, status)
+                (documents_ptr_id, lease_id, amount, cheque_type, payment_type, status)
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
             [txn_id, lease_id, amount, cheque_type, "CHEQUE", status],
@@ -929,7 +929,7 @@ class PostChequeClearingTests(TestCase):
 
     def _set_status(self, cursor, txn_id, status):
         cursor.execute(
-            "UPDATE lease_leasetransaction SET status = %s WHERE id = %s",
+            "UPDATE lease_leasetransaction SET status = %s WHERE documents_ptr_id = %s",
             [status, txn_id],
         )
 
@@ -1201,7 +1201,7 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS lease_leasetransaction (
-                    id BIGSERIAL PRIMARY KEY,
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
                     lease_id BIGINT NOT NULL,
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
@@ -1272,7 +1272,7 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
         with connection.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO lease_leasetransaction "
-                "(id, lease_id, amount, cheque_type, payment_type, status) "
+                "(documents_ptr_id, lease_id, amount, cheque_type, payment_type, status) "
                 "VALUES (%s, %s, %s, %s, %s, %s)",
                 [200, 50, 7500, "RENT_CHEQUE", "CHEQUE", "BALANCE"],
             )
@@ -1346,7 +1346,7 @@ class PostBounceReversalTests(TestCase):
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS lease_leasetransaction (
-                    id BIGSERIAL PRIMARY KEY,
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
                     lease_id BIGINT NOT NULL,
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
@@ -1421,7 +1421,7 @@ class PostBounceReversalTests(TestCase):
         cursor.execute(
             """
             INSERT INTO lease_leasetransaction
-                (id, lease_id, amount, cheque_type, payment_type, status)
+                (documents_ptr_id, lease_id, amount, cheque_type, payment_type, status)
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
             [txn_id, lease_id, amount, cheque_type, "CHEQUE", status],
@@ -1441,7 +1441,7 @@ class PostBounceReversalTests(TestCase):
 
     def _set_status(self, cursor, txn_id, status):
         cursor.execute(
-            "UPDATE lease_leasetransaction SET status = %s WHERE id = %s",
+            "UPDATE lease_leasetransaction SET status = %s WHERE documents_ptr_id = %s",
             [status, txn_id],
         )
 
@@ -1847,7 +1847,7 @@ class PostBounceFeeTests(TestCase):
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS lease_leasetransaction (
-                    id BIGSERIAL PRIMARY KEY,
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
                     lease_id BIGINT NOT NULL,
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
@@ -1946,7 +1946,7 @@ class PostBounceFeeTests(TestCase):
         cursor.execute(
             """
             INSERT INTO lease_leasetransaction
-                (id, lease_id, amount, cheque_type, payment_type, status,
+                (documents_ptr_id, lease_id, amount, cheque_type, payment_type, status,
                  created, charge_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
@@ -1998,7 +1998,7 @@ class PostBounceFeeTests(TestCase):
         )
         self.assertTrue(post_rent_ar(txn_id)["posted"])
         cursor.execute(
-            "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = %s",
+            "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE documents_ptr_id = %s",
             [txn_id],
         )
         self.assertTrue(post_bounce_reversal(txn_id)["posted"])
@@ -2240,7 +2240,7 @@ class PostBounceFeeTests(TestCase):
             )
             self.assertTrue(post_rent_ar(450)["posted"])
             cursor.execute(
-                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 450"
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE documents_ptr_id = 450"
             )
             self.assertTrue(post_bounce_reversal(450)["posted"])
 
@@ -2250,7 +2250,7 @@ class PostBounceFeeTests(TestCase):
             )
             self.assertTrue(post_rent_ar(451)["posted"])
             cursor.execute(
-                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 451"
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE documents_ptr_id = 451"
             )
             self.assertTrue(post_bounce_reversal(451)["posted"])
 
@@ -2316,7 +2316,7 @@ class PostBounceFeeTests(TestCase):
             )
             self.assertTrue(post_rent_ar(460)["posted"])
             cursor.execute(
-                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 460"
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE documents_ptr_id = 460"
             )
             self.assertTrue(post_bounce_reversal(460)["posted"])
 
@@ -2366,7 +2366,7 @@ class PostBounceFeeTests(TestCase):
             )
             self.assertTrue(post_rent_ar(470)["posted"])
             cursor.execute(
-                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 470"
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE documents_ptr_id = 470"
             )
             self.assertTrue(post_bounce_reversal(470)["posted"])
 
@@ -2376,7 +2376,7 @@ class PostBounceFeeTests(TestCase):
             )
             self.assertTrue(post_rent_ar(471)["posted"])
             cursor.execute(
-                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE id = 471"
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' WHERE documents_ptr_id = 471"
             )
             self.assertTrue(post_bounce_reversal(471)["posted"])
 
@@ -3014,7 +3014,7 @@ class PostCommissionSplitTests(TestCase):
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS lease_leasetransaction (
-                    id BIGSERIAL PRIMARY KEY,
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
                     lease_id BIGINT NOT NULL,
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL,
@@ -3102,7 +3102,7 @@ class PostCommissionSplitTests(TestCase):
         cursor.execute(
             """
             INSERT INTO lease_leasetransaction
-                (id, lease_id, amount, cheque_type, payment_type, status)
+                (documents_ptr_id, lease_id, amount, cheque_type, payment_type, status)
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
             [txn_id, lease_id, amount, cheque_type, "CHEQUE", status],
@@ -3273,7 +3273,7 @@ class PostCommissionSplitTests(TestCase):
             # this pmc_id? No -- profile exists for pmc_id=1. Instead make
             # amount null so post_rent_ar itself fails with missing_amount.
             cursor.execute(
-                "UPDATE lease_leasetransaction SET amount = NULL WHERE id = %s",
+                "UPDATE lease_leasetransaction SET amount = NULL WHERE documents_ptr_id = %s",
                 [403],
             )
 
@@ -4387,6 +4387,112 @@ class TrialBalanceReportTests(TestCase):
         self.assertTrue(response.json()["content"]["balanced"])
 
 
+class FinancePmcProfileStatusTests(TrialBalanceReportTests):
+    """AD-6 / frontend-prd.md FFR-3 tests: GET /finance-pmc-profile/<pmc_id>/status.
+
+    Subclasses `TrialBalanceReportTests` to reuse its stand-in-table
+    setUpClass/tearDownClass/setUp and _make_token/_make_owner_with_pmc/
+    _make_profile/_post_journal_entry helpers (same pattern as
+    ProfitLossReportTests/BalanceSheetReportTests/AgeingReportTests).
+
+    Named `_status_url` (not `_url`) deliberately: this endpoint takes
+    `pmc_id` as a URL path segment, not a query param like Trial Balance's
+    own `_url()` -- overriding `_url` with an incompatible signature would
+    break every inherited Trial-Balance-specific test method this class
+    also inherits (they all call `self._url()` with zero args).
+    """
+
+    def _status_url(self, pmc_id):
+        return reverse("finance-pmc-profile-status", args=[pmc_id])
+
+    def test_not_activated_when_no_profile_exists(self):
+        token = self._make_token("owner@example.com")
+        self._make_owner_with_pmc(
+            1, "owner@example.com", token, 201, unit_id=10, property_id=20, pmc_id=1
+        )
+        # Deliberately no FinancePMCProfile created for pmc_id=1.
+
+        response = self.client.get(
+            self._status_url(1), HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"]["status"], "not_activated")
+
+    def test_activated_empty_when_profile_exists_with_no_journal_entries(self):
+        self._make_profile(pmc_id=1)
+        token = self._make_token("owner@example.com")
+        self._make_owner_with_pmc(
+            1, "owner@example.com", token, 201, unit_id=10, property_id=20, pmc_id=1
+        )
+
+        response = self.client.get(
+            self._status_url(1), HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"]["status"], "activated_empty")
+
+    def test_activated_when_profile_has_posted_activity(self):
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=1)
+        token = self._make_token("owner@example.com")
+        self._make_owner_with_pmc(
+            1, "owner@example.com", token, 201, unit_id=10, property_id=20, pmc_id=1
+        )
+        self._post_journal_entry(
+            profile,
+            "CREATE-BALANCE",
+            [("AR — Tenants", 100, 0), ("Rent Income", 0, 100)],
+            posted_at=dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc),
+            source_txn_id=110,
+        )
+
+        response = self.client.get(
+            self._status_url(1), HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"]["status"], "activated")
+
+    def test_unreachable_pmc_returns_403_regardless_of_activation(self):
+        """An unreachable pmc_id must never distinguish "doesn't exist" from
+        "exists but unactivated" via response differences -- both are 403."""
+        token = self._make_token("owner@example.com")
+        self._make_owner_with_pmc(
+            1, "owner@example.com", token, 201, unit_id=10, property_id=20, pmc_id=1
+        )
+        # pmc_id=999 is never linked to this owner's reachable PMCs, and has
+        # no FinancePMCProfile either -- both facts must stay invisible.
+
+        response = self.client.get(
+            self._status_url(999), HTTP_AUTHORIZATION=f"Bearer {token}"
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_missing_auth_returns_401_before_any_query(self):
+        response = self.client.get(self._status_url(1))
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_no_slash_route_also_resolves(self):
+        self._make_profile(pmc_id=1)
+        token = self._make_token("owner@example.com")
+        self._make_owner_with_pmc(
+            1, "owner@example.com", token, 201, unit_id=10, property_id=20, pmc_id=1
+        )
+
+        response = self.client.get(
+            reverse("finance-pmc-profile-status-no-slash", args=[1]),
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"]["status"], "activated_empty")
+
+
 class ProfitLossReportTests(TrialBalanceReportTests):
     """Story 3.3 tests: GET /reports/profit-loss.
 
@@ -5161,7 +5267,7 @@ class AgeingReportTests(TrialBalanceReportTests):
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS lease_leasetransaction (
-                    id BIGSERIAL PRIMARY KEY,
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
                     lease_id BIGINT NOT NULL,
                     amount DOUBLE PRECISION,
                     cheque_type VARCHAR(20) NOT NULL DEFAULT 'RENT_CHEQUE',
@@ -5206,7 +5312,7 @@ class AgeingReportTests(TrialBalanceReportTests):
         with connection.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO lease_leasetransaction "
-                "(id, lease_id, amount, cheque_type, payment_type, status, cheque_date) "
+                "(documents_ptr_id, lease_id, amount, cheque_type, payment_type, status, cheque_date) "
                 "VALUES (%s, %s, %s, %s, 'CHEQUE', %s, %s)",
                 [txn_id, lease_id, amount, cheque_type, status, cheque_date],
             )
