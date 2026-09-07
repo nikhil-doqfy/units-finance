@@ -108,7 +108,15 @@ def sync_lease_transaction(request, lease_transaction_id):
             status=400,
         )
 
-    txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
+    # `created` lives only on units-backend's parent `Documents` table (MTI:
+    # `LeaseTransaction(Documents)`), not on `lease_leasetransaction` itself --
+    # deferred here since this endpoint never reads it, and selecting it would
+    # 500 with `column lease_leasetransaction.created does not exist`.
+    txn = (
+        LeaseTransactionRef.objects.filter(pk=lease_transaction_id)
+        .defer("created")
+        .first()
+    )
     posting_results = {}
     if txn is not None:
         # Unresolvable-PMC and duplicate-skip are both non-5xx, logged

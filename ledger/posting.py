@@ -225,7 +225,16 @@ def post_rent_ar(lease_transaction_id, txn=None):
     (not modeled above) propagates out of the atomic block.
     """
     if txn is None:
-        txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
+        # `created` lives only on units-backend's parent `Documents` table
+        # (MTI: `LeaseTransaction(Documents)`), not on `lease_leasetransaction`
+        # itself -- deferred here since this function never reads it, and
+        # selecting it would 500 with `column lease_leasetransaction.created
+        # does not exist`.
+        txn = (
+            LeaseTransactionRef.objects.filter(pk=lease_transaction_id)
+            .defer("created")
+            .first()
+        )
     if txn is None:
         logger.error(
             "post_rent_ar: no LeaseTransaction found for id=%s -- cannot post",
@@ -388,7 +397,16 @@ def post_cheque_clearing(lease_transaction_id, txn=None):
     not a naming bug to "fix" by adding a gate back.
     """
     if txn is None:
-        txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
+        # `created` lives only on units-backend's parent `Documents` table
+        # (MTI: `LeaseTransaction(Documents)`), not on `lease_leasetransaction`
+        # itself -- deferred here since this function never reads it, and
+        # selecting it would 500 with `column lease_leasetransaction.created
+        # does not exist`.
+        txn = (
+            LeaseTransactionRef.objects.filter(pk=lease_transaction_id)
+            .defer("created")
+            .first()
+        )
     if txn is None:
         logger.error(
             "post_cheque_clearing: no LeaseTransaction found for id=%s -- "
@@ -583,7 +601,16 @@ def post_bounce_reversal(lease_transaction_id, txn=None):
     existing prior-posting/idempotency checks below.
     """
     if txn is None:
-        txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
+        # `created` lives only on units-backend's parent `Documents` table
+        # (MTI: `LeaseTransaction(Documents)`), not on `lease_leasetransaction`
+        # itself -- deferred here since this function never reads it, and
+        # selecting it would 500 with `column lease_leasetransaction.created
+        # does not exist`.
+        txn = (
+            LeaseTransactionRef.objects.filter(pk=lease_transaction_id)
+            .defer("created")
+            .first()
+        )
     if txn is None:
         logger.error(
             "post_bounce_reversal: no LeaseTransaction found for id=%s -- "
@@ -808,6 +835,15 @@ def post_bounce_fee(lease_transaction_id, txn=None):
     has no status transition of its own (Design Notes).
     """
     if txn is None:
+        # NOTE: `created` is intentionally NOT deferred here (unlike every
+        # other posting function's fetch-if-missing block) -- this function's
+        # nearest-neighbor pairing logic below genuinely reads `txn.created`,
+        # and `created` is not a real column on `lease_leasetransaction` (it
+        # lives only on units-backend's parent `Documents` table via MTI:
+        # `LeaseTransaction(Documents)`). Selecting it here still raises
+        # `column lease_leasetransaction.created does not exist` until the
+        # pairing logic is reworked to join through `Documents` or use a
+        # different ordering key (see `candidate_txn.created` below).
         txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
     if txn is None:
         logger.error(
@@ -890,6 +926,13 @@ def post_bounce_fee(lease_transaction_id, txn=None):
         candidate_id = entry.source_lease_transaction_id
         if str(candidate_id) in already_paired_bounce_ids:
             continue
+        # NOTE: `created` is intentionally NOT deferred here -- the check
+        # just below genuinely reads `candidate_txn.created`, and `created`
+        # is not a real column on `lease_leasetransaction` (see the note on
+        # this function's own `txn` fetch above). Still raises
+        # `column lease_leasetransaction.created does not exist` until the
+        # pairing logic is reworked to join through `Documents` or use a
+        # different ordering key.
         candidate_txn = LeaseTransactionRef.objects.filter(pk=candidate_id).first()
         if candidate_txn is None:
             continue
@@ -1312,7 +1355,16 @@ def post_commission_split(lease_transaction_id, txn=None):
     DB error propagates out of the atomic block.
     """
     if txn is None:
-        txn = LeaseTransactionRef.objects.filter(pk=lease_transaction_id).first()
+        # `created` lives only on units-backend's parent `Documents` table
+        # (MTI: `LeaseTransaction(Documents)`), not on `lease_leasetransaction`
+        # itself -- deferred here since this function never reads it, and
+        # selecting it would 500 with `column lease_leasetransaction.created
+        # does not exist`.
+        txn = (
+            LeaseTransactionRef.objects.filter(pk=lease_transaction_id)
+            .defer("created")
+            .first()
+        )
     if txn is None:
         logger.error(
             "post_commission_split: no LeaseTransaction found for id=%s -- "
