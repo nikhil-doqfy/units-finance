@@ -35,10 +35,12 @@ from ledger.decorators import require_internal_token
 from ledger.models import (
     Account,
     BankStatementMatch,
+    ChargeRef,
     FinancePMCProfile,
     JournalEntry,
     LeaseRef,
     LeaseTransactionRef,
+    PMCChargeType,
 )
 from ledger.manual_entries import ManualEntryValidationError, post_manual_entry
 from ledger.org_scope import get_pmc_ids_for_user_profile
@@ -48,6 +50,7 @@ from ledger.posting import (
     post_bounce_reversal,
     post_cheque_clearing,
     post_commission_split,
+    post_other_charge,
     post_rent_ar,
     post_security_deposit,
 )
@@ -157,9 +160,22 @@ def sync_lease_transaction(request, lease_transaction_id):
         # Story 2.5: runs on every sync regardless of cheque_type -- its own
         # cheque_type == OTHER_CHARGE / charge_id-not-null gate lives inside
         # post_bounce_fee itself (spec Boundaries & Constraints).
-        posting_results["bounce_fee"] = post_bounce_fee(
-            lease_transaction_id, txn=txn
-        )
+        bounce_fee_result = post_bounce_fee(lease_transaction_id, txn=txn)
+        posting_results["bounce_fee"] = bounce_fee_result
+
+        # Story 5.2 (FR-17): the sibling gap post_bounce_fee deliberately
+        # leaves open -- an OTHER_CHARGE transaction with NO unresolved
+        # bounce on its lease. Called only when post_bounce_fee's own
+        # result reason is "no_unresolved_bounce" (spec Code Map/Tasks) --
+        # never alongside a successful post_bounce_fee post, and never for
+        # a non-OTHER_CHARGE transaction (post_bounce_fee's own
+        # cheque_type/charge_id gate already excludes those via
+        # "not_other_charge_type", which post_other_charge's own identical
+        # gate then also no-ops on).
+        if bounce_fee_result.get("reason") == "no_unresolved_bounce":
+            posting_results["other_charge"] = post_other_charge(
+                lease_transaction_id, txn=txn
+            )
 
     return prepare_response(
         content={
@@ -1399,5 +1415,200 @@ def _list_manual_journal_entries(request):
             ],
         },
         message="Manual journal entries retrieved",
+        status=200,
+    )
+
+
+@api_view(["POST", "GET"])
+def pmc_charge_types(request):
+    """Story 5.2: `POST`/`GET /ledger/pmc-charge-types` (FR-17).
+
+    `POST` creates or updates a `(finance_pmc_profile, charge_id)` mapping
+    row (an operator picks an existing `Charge` catalog row and a Finance
+    `Account` to route it to, per PMC); `GET` lists existing mappings for a
+    PMC. Both dispatch off one path, matching `create_manual_journal_entry`'s
+    own POST/GET-on-one-URL precedent (spec Code Map: "following
+    create_manual_journal_entry's exact auth -> parse/validate ->
+    resolve-profile -> scope-check sequence").
+
+    `POST` body: `pmc_id`, `charge_id`, `account_id` required; `active`
+    optional (defaults `True`). Upserts on `(finance_pmc_profile, charge_id)`
+    -- a second POST for the same pair updates the existing row (its
+    `account`/`active`) rather than creating a duplicate, since the model
+    has no unique constraint of its own to rely on and the spec's Never
+    ("never let an inactive PMCChargeType produce a new posting") implies
+    exactly one row governs a given charge_id's routing at a time.
+    """
+    if request.method == "GET":
+        return _list_pmc_charge_types(request)
+
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.data.get("pmc_id")
+    raw_charge_id = request.data.get("charge_id")
+    raw_account_id = request.data.get("account_id")
+    active = request.data.get("active", True)
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    charge_id = None
+    if raw_charge_id is not None:
+        try:
+            charge_id = int(raw_charge_id)
+        except (TypeError, ValueError):
+            charge_id = None
+
+    account_id = None
+    if raw_account_id is not None:
+        try:
+            account_id = int(raw_account_id)
+        except (TypeError, ValueError):
+            account_id = None
+
+    if pmc_id is None or charge_id is None or account_id is None:
+        return prepare_response(
+            content={
+                "pmc_id": raw_pmc_id,
+                "charge_id": raw_charge_id,
+                "account_id": raw_account_id,
+            },
+            message="pmc_id, charge_id, and account_id are required",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to configure charge types for this PMC",
+            status=403,
+        )
+
+    account = Account.objects.filter(
+        pk=account_id, finance_pmc_profile=finance_pmc_profile
+    ).first()
+    if account is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id, "account_id": account_id},
+            message="No Account exists for the given account_id and pmc_id",
+            status=400,
+        )
+
+    charge = ChargeRef.objects.filter(pk=charge_id).first()
+    if charge is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id, "charge_id": charge_id},
+            message="No Charge exists for the given charge_id",
+            status=400,
+        )
+
+    charge_type, created = PMCChargeType.objects.update_or_create(
+        finance_pmc_profile=finance_pmc_profile,
+        charge_id=charge_id,
+        defaults={"account": account, "active": bool(active)},
+    )
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "id": charge_type.id,
+            "charge_id": charge_type.charge_id,
+            "account_id": charge_type.account_id,
+            "account_name": account.name,
+            "active": charge_type.active,
+        },
+        message="PMC charge type saved",
+        status=201 if created else 200,
+    )
+
+
+def _list_pmc_charge_types(request):
+    """Story 5.2: list existing `PMCChargeType` mappings for a PMC, backing
+    the new Finance settings page's list view. Plain (undecorated) function,
+    called directly by `pmc_charge_types`'s own GET dispatch (mirrors
+    `_list_manual_journal_entries`'s established pattern -- wrapping this in
+    its own `@api_view` would re-wrap an already-DRF-wrapped `request` and
+    raise `AssertionError`).
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    if pmc_id is None:
+        return prepare_response(
+            content={"pmc_id": raw_pmc_id},
+            message="pmc_id is required",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view charge types for this PMC",
+            status=403,
+        )
+
+    charge_types = (
+        PMCChargeType.objects.filter(finance_pmc_profile=finance_pmc_profile)
+        .select_related("account")
+        .order_by("-created", "-id")
+    )
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "charge_types": [
+                {
+                    "id": ct.id,
+                    "charge_id": ct.charge_id,
+                    "account_id": ct.account_id,
+                    "account_name": ct.account.name,
+                    "active": ct.active,
+                }
+                for ct in charge_types
+            ],
+        },
+        message="PMC charge types retrieved",
         status=200,
     )

@@ -11,6 +11,7 @@ from ledger.views import (
     chart_of_accounts,
     create_manual_journal_entry,
     finance_pmc_profile_status,
+    pmc_charge_types,
     profit_loss_report,
     suggested_matches,
     sync_lease,
@@ -191,5 +192,20 @@ urlpatterns = [
         'ledger/manual-entries',
         create_manual_journal_entry,
         name='create-manual-journal-entry-no-slash',
+    ),
+    # Story 5.2 / FR-17: PMC charge type <-> Account mappings -- trailing-
+    # slash + no-slash pair, matching the established route-pair convention
+    # above (spec Code Map). POST creates/updates a mapping row; GET lists
+    # existing ones for the PMC (both share the same path, mirroring
+    # Story 5.1's manual-entries route).
+    path(
+        'ledger/pmc-charge-types/',
+        pmc_charge_types,
+        name='pmc-charge-types',
+    ),
+    path(
+        'ledger/pmc-charge-types',
+        pmc_charge_types,
+        name='pmc-charge-types-no-slash',
     ),
 ]

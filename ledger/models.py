@@ -78,6 +78,68 @@ class Account(models.Model):
         return f"Account(name={self.name}, type={self.account_type}, pmc_profile_id={self.finance_pmc_profile_id})"
 
 
+class PMCChargeType(models.Model):
+    """Story 5.2 (FR-17): maps an existing units-backend `Charge` catalog
+    row to a Finance `Account`, one row per `(finance_pmc_profile,
+    charge_id)` pair.
+
+    Finance-owned -- never a modification to units-backend's `charges` app
+    or `Charge` model (spec Always); Finance only ever reads `Charge` via
+    the existing unmanaged `ChargeRef` (AD-5 precedent). `charge_id` is
+    deliberately a plain `BigIntegerField`, not a Django FK, mirroring every
+    other cross-service reference in this codebase (AD-19 precedent) -- it
+    references units-backend's `Charge.id`, which lives in a different
+    Django project's migration set despite sharing the same Postgres
+    instance.
+
+    `account` IS a real Django `ForeignKey` -- both `PMCChargeType` and
+    `Account` are Finance-owned models living in this same app/database
+    (spec Always).
+
+    An inactive row (`active=False`) never produces a new posting, but
+    existing postings from when it was active remain untouched -- no
+    retroactive reversal (spec Never).
+    """
+
+    finance_pmc_profile = models.ForeignKey(
+        FinancePMCProfile,
+        on_delete=models.CASCADE,
+        related_name="pmc_charge_types",
+    )
+    charge_id = models.BigIntegerField(
+        help_text="units-backend Charge.id — not a cross-DB FK (AD-19 precedent)."
+    )
+    account = models.ForeignKey(
+        Account,
+        on_delete=models.CASCADE,
+        related_name="pmc_charge_types",
+    )
+    active = models.BooleanField(default=True)
+    created = models.DateTimeField(auto_now_add=True)
+    modified = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        # Post-review addition: the ORM's `.filter(...).first()` lookups in
+        # `post_other_charge`/`pmc_charge_types` assume exactly one row per
+        # pair -- without this, a concurrent-POST race (or a direct
+        # `.create()` bypassing the endpoint's `update_or_create`) could
+        # produce a duplicate, and `.first()` would silently pick an
+        # arbitrary one instead of erroring.
+        constraints = [
+            models.UniqueConstraint(
+                fields=["finance_pmc_profile", "charge_id"],
+                name="unique_pmc_charge_type_per_profile_and_charge",
+            )
+        ]
+
+    def __str__(self):
+        return (
+            f"PMCChargeType(finance_pmc_profile_id={self.finance_pmc_profile_id}, "
+            f"charge_id={self.charge_id}, account_id={self.account_id}, "
+            f"active={self.active})"
+        )
+
+
 class PropertyManagmentCompanyRef(models.Model):
     """Read-only reference onto units-backend's PropertyManagmentCompany table.
 

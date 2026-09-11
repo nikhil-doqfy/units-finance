@@ -60,7 +60,10 @@ def _to_decimal(value, field_name):
         )
 
 
-def post_manual_entry(finance_pmc_profile, lines, memo=""):
+def post_manual_entry(
+    finance_pmc_profile, lines, memo="", source_lease_transaction_id=None,
+    source_status_transition="",
+):
     """Validate and post a balanced manual `JournalEntry`.
 
     `lines` is a list of dicts, each with `account_id`, `debit`, `credit`
@@ -68,6 +71,15 @@ def post_manual_entry(finance_pmc_profile, lines, memo=""):
     `ManualEntryValidationError` on any validation failure -- no rows are
     ever created in that case (spec I/O matrix: "No rows created" on every
     error row). Returns the created `JournalEntry` on success.
+
+    `source_lease_transaction_id`/`source_status_transition` (Story 5.2,
+    FR-17): let a posting-engine caller (`post_other_charge`) reuse this
+    same construct-and-validate path while still carrying a real
+    idempotency key back to the triggering `LeaseTransaction` -- unlike an
+    operator-entered manual entry (Story 5.1), which always leaves both at
+    their default (`None`/`""`). `source_type` is always `MANUAL` either
+    way (spec Always: "a balanced manual-entry-style Journal Entry ...
+    source_type = MANUAL").
     """
     if not lines or len(lines) < MIN_LINES:
         raise ManualEntryValidationError("At least two lines are required")
@@ -130,9 +142,9 @@ def post_manual_entry(finance_pmc_profile, lines, memo=""):
     with transaction.atomic():
         entry = JournalEntry.objects.create(
             finance_pmc_profile=finance_pmc_profile,
-            source_lease_transaction_id=None,
+            source_lease_transaction_id=source_lease_transaction_id,
             source_type=JournalEntry.MANUAL,
-            source_status_transition="",
+            source_status_transition=source_status_transition,
             memo=memo,
         )
 
