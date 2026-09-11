@@ -66,6 +66,34 @@ class Account(models.Model):
         (EQUITY, "Equity"),
     ]
 
+    # Story 5.3 (FR-18): sub-categories under the five flat account_type
+    # values, so Balance Sheet/CoA views can group accounts the way an
+    # accountant expects. Deliberately not cross-field-validated against
+    # account_type at the DB level (spec Boundaries & Constraints) -- a
+    # Phase-1 fixed seed with no CoA editor makes that disproportionate.
+    FIXED_ASSET = "FIXED_ASSET"
+    CURRENT_ASSET = "CURRENT_ASSET"
+    OTHER_CURRENT_ASSET = "OTHER_CURRENT_ASSET"
+    # Named LIABILITY_SUBTYPE (post-review clarification), NOT the same
+    # Python attribute as the parent `Account.LIABILITY` account_type above
+    # -- deliberately the same stored string value, though, per the epic's
+    # own AC ("LIABILITY (unchanged split retained)"): Phase 1 keeps a
+    # single Liability subtype rather than splitting current/long-term
+    # liabilities. Always reference this constant, never the raw string
+    # "LIABILITY", so a future split stays a one-place rename.
+    LIABILITY_SUBTYPE = "LIABILITY"
+    CAPITAL_CONTRIBUTION = "CAPITAL_CONTRIBUTION"
+    SHARE_CAPITAL = "SHARE_CAPITAL"
+
+    ACCOUNT_SUBTYPE_CHOICES = [
+        (FIXED_ASSET, "Fixed Asset"),
+        (CURRENT_ASSET, "Current Asset"),
+        (OTHER_CURRENT_ASSET, "Other Current Asset"),
+        (LIABILITY_SUBTYPE, "Liability"),
+        (CAPITAL_CONTRIBUTION, "Capital Contribution"),
+        (SHARE_CAPITAL, "Share Capital"),
+    ]
+
     finance_pmc_profile = models.ForeignKey(
         FinancePMCProfile,
         on_delete=models.CASCADE,
@@ -73,6 +101,16 @@ class Account(models.Model):
     )
     name = models.CharField(max_length=255)
     account_type = models.CharField(max_length=20, choices=ACCOUNT_TYPE_CHOICES)
+    account_subtype = models.CharField(
+        max_length=25,
+        choices=ACCOUNT_SUBTYPE_CHOICES,
+        null=True,
+        blank=True,
+        help_text="Sub-category under account_type (Story 5.3/FR-18) -- "
+        "nullable so a migration adding this field never breaks existing "
+        "rows (spec Always). None for Income/Expense accounts, which have "
+        "no subtype in Phase 1.",
+    )
 
     def __str__(self):
         return f"Account(name={self.name}, type={self.account_type}, pmc_profile_id={self.finance_pmc_profile_id})"

@@ -381,23 +381,38 @@ def compute_chart_of_accounts(finance_pmc_profile):
     `compute_balance_sheet`).
 
     Returns a dict: `{"accounts": [...]}`, where each account dict has
-    `id`, `name`, `account_type`, `balance` -- deliberately a smaller shape
-    than Trial Balance's row (no separate `total_debit`/`total_credit`
-    exposed), since this view's job is "what Accounts exist and what do
-    they currently hold," not a period debit/credit breakdown (that's
-    Trial Balance's job, and remains reachable via the existing endpoint
-    for the same PMC).
+    `id`, `name`, `account_type`, `account_subtype`, `balance` --
+    deliberately a smaller shape than Trial Balance's row (no separate
+    `total_debit`/`total_credit` exposed), since this view's job is "what
+    Accounts exist and what do they currently hold," not a period
+    debit/credit breakdown (that's Trial Balance's job, and remains
+    reachable via the existing endpoint for the same PMC).
+
+    Story 5.3 (FR-18) adds `account_subtype`, read via one lightweight
+    `values_list` lookup keyed on `row["id"]` -- `compute_trial_balance`'s
+    own row dicts don't carry this field, so this one extra query is scoped
+    to this function only, never touching the shared
+    trial-balance/profit-loss/balance-sheet aggregation chain (spec Never).
+    `None` for any account without a subtype (Income/Expense accounts, or
+    any pre-existing row left uncategorized by the Story 5.3 migration).
     """
     since_inception = finance_pmc_profile.created.date()
     today = timezone.localdate()
 
     trial_balance = compute_trial_balance(finance_pmc_profile, since_inception, today)
 
+    account_subtypes_by_id = dict(
+        Account.objects.filter(finance_pmc_profile=finance_pmc_profile).values_list(
+            "id", "account_subtype"
+        )
+    )
+
     accounts = [
         {
             "id": row["id"],
             "name": row["name"],
             "account_type": row["account_type"],
+            "account_subtype": account_subtypes_by_id.get(row["id"]),
             "balance": (
                 row["total_credit"] - row["total_debit"]
                 if row["account_type"] in _CREDIT_NORMAL_ACCOUNT_TYPES

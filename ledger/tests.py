@@ -38,6 +38,7 @@ from ledger.models import (
     PMCChargeType,
 )
 from ledger.org_scope import get_pmc_ids_for_user_profile
+from ledger.reports import compute_chart_of_accounts
 from ledger.posting import (
     post_bounce_fee,
     post_bounce_reversal,
@@ -196,27 +197,48 @@ class SeedStandardChartOfAccountsTests(TestCase):
         accounts = Account.objects.filter(finance_pmc_profile=profile)
         self.assertEqual(accounts.count(), len(STANDARD_CHART_OF_ACCOUNTS))
 
-        actual_pairs = {(a.name, a.account_type) for a in accounts}
-        expected_pairs = set(STANDARD_CHART_OF_ACCOUNTS)
-        self.assertEqual(actual_pairs, expected_pairs)
+        actual_triples = {(a.name, a.account_type, a.account_subtype) for a in accounts}
+        expected_triples = set(STANDARD_CHART_OF_ACCOUNTS)
+        self.assertEqual(actual_triples, expected_triples)
 
         # Independent of STANDARD_CHART_OF_ACCOUNTS — asserts the literal FR-3
-        # + Story 2.4 account list so a typo/misclassification introduced in
-        # seed.py itself would fail this test, not just self-agree with it.
+        # + Story 2.4 + Story 5.3 (FR-18) account list so a typo/
+        # misclassification introduced in seed.py itself would fail this
+        # test, not just self-agree with it.
         self.assertEqual(
-            actual_pairs,
+            actual_triples,
             {
-                ("Rent Income", Account.INCOME),
-                ("Security Deposits Held", Account.LIABILITY),
-                ("VAT Payable", Account.LIABILITY),
-                ("Bank", Account.ASSET),
-                ("AR — Tenants", Account.ASSET),
-                ("AP — PMC Commission", Account.LIABILITY),
-                ("Commission Expense", Account.EXPENSE),
-                ("Bank Charges/Fees", Account.EXPENSE),
-                ("Bounced Cheques", Account.ASSET),
+                ("Rent Income", Account.INCOME, None),
+                ("Security Deposits Held", Account.LIABILITY, Account.LIABILITY_SUBTYPE),
+                ("VAT Payable", Account.LIABILITY, Account.LIABILITY_SUBTYPE),
+                ("Bank", Account.ASSET, Account.CURRENT_ASSET),
+                ("AR — Tenants", Account.ASSET, Account.CURRENT_ASSET),
+                ("AP — PMC Commission", Account.LIABILITY, Account.LIABILITY_SUBTYPE),
+                ("Commission Expense", Account.EXPENSE, None),
+                ("Bank Charges/Fees", Account.EXPENSE, None),
+                ("Bounced Cheques", Account.ASSET, Account.CURRENT_ASSET),
             },
         )
+
+    def test_no_seeded_account_left_uncategorized_except_income_expense(self):
+        """Story 5.3 (FR-18) I/O matrix row 1: every one of the 9 standard
+        accounts has an explicit account_subtype, except Income/Expense
+        accounts (which have nothing to subtype into in Phase 1)."""
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=1,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+        for account in Account.objects.filter(finance_pmc_profile=profile):
+            if account.account_type in (Account.INCOME, Account.EXPENSE):
+                self.assertIsNone(account.account_subtype)
+            else:
+                self.assertIsNotNone(
+                    account.account_subtype,
+                    f"{account.name} ({account.account_type}) was left uncategorized",
+                )
 
     def test_seed_helper_called_twice_directly_creates_duplicates(self):
         """Documents the seed helper's actual (non-)idempotency contract.
@@ -296,6 +318,78 @@ class SeedStandardChartOfAccountsTests(TestCase):
             Account.objects.filter(finance_pmc_profile=profile).count(),
             len(STANDARD_CHART_OF_ACCOUNTS),
         )
+
+
+class AccountSubtypeTests(TestCase):
+    """Story 5.3 (FR-18) tests: `account_subtype` field, seed backfill, and
+    Chart of Accounts view surfacing.
+
+    Covers all three I/O matrix rows from the spec:
+      1. New PMC seeded after this story ships -- all 9 accounts have both
+         account_type and account_subtype set (correct value, or None for
+         Income/Expense) -- see test_no_seeded_account_left_uncategorized_
+         except_income_expense above for the full backfill assertion.
+      2. Existing PMC, seeded before this story -- account_subtype is null
+         immediately after the migration, no data migration touches
+         existing rows.
+      3. Chart of Accounts view (compute_chart_of_accounts) -- response
+         includes account_subtype per row (null for pre-existing
+         unbackfilled rows, a real value for newly-seeded ones).
+    """
+
+    def test_existing_preseeded_rows_stay_null_after_field_added(self):
+        """Simulates a pre-Story-5.3 Account row (created without ever
+        setting account_subtype, as if seeded before this migration) --
+        confirms it is simply null, never guessed/backfilled (spec
+        Boundaries & Constraints/Design Notes: no best-effort name-matching
+        backfill migration)."""
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=1,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+        # Bypass the seed helper entirely to model a genuinely pre-existing
+        # row that predates the account_subtype field/backfill.
+        pre_existing = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Bank",
+            account_type=Account.ASSET,
+        )
+
+        pre_existing.refresh_from_db()
+        self.assertIsNone(pre_existing.account_subtype)
+
+    def test_chart_of_accounts_report_includes_account_subtype(self):
+        """New-PMC CoA rows surface their real subtype; a null-subtype row
+        (modeling a pre-existing, unbackfilled account) surfaces as None --
+        never a fabricated guess."""
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=1,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+        # Add a stand-in "pre-existing, unbackfilled" row alongside the
+        # newly-seeded ones.
+        Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Legacy Suspense",
+            account_type=Account.ASSET,
+        )
+
+        result = compute_chart_of_accounts(profile)
+        by_name = {row["name"]: row["account_subtype"] for row in result["accounts"]}
+
+        self.assertEqual(by_name["Bank"], Account.CURRENT_ASSET)
+        self.assertEqual(by_name["AR — Tenants"], Account.CURRENT_ASSET)
+        self.assertEqual(by_name["Security Deposits Held"], Account.LIABILITY_SUBTYPE)
+        self.assertEqual(by_name["VAT Payable"], Account.LIABILITY_SUBTYPE)
+        self.assertEqual(by_name["AP — PMC Commission"], Account.LIABILITY_SUBTYPE)
+        self.assertIsNone(by_name["Rent Income"])
+        self.assertIsNone(by_name["Commission Expense"])
+        self.assertIsNone(by_name["Bank Charges/Fees"])
+        self.assertIsNone(by_name["Legacy Suspense"])
 
 
 @override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token")
