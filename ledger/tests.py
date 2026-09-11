@@ -7321,3 +7321,644 @@ class BankStatementMatchTests(TestCase):
         self.assertEqual(response.status_code, 200)
         line.refresh_from_db()
         self.assertTrue(line.reconciled)
+
+
+class ManualJournalEntryEndpointTests(TrialBalanceReportTests):
+    """Story 5.1 tests: POST/GET /ledger/manual-entries (FR-16).
+
+    Subclasses `TrialBalanceReportTests` to reuse its stand-in-table
+    setUpClass/tearDownClass/setUp and its `_make_profile`/
+    `_make_owner_with_pmc`/`_make_token` helpers -- this endpoint follows
+    the same auth/validate/resolve/scope sequence as Trial Balance (spec
+    Code Map), so the same fixtures apply unchanged.
+
+    Covers every row of the spec's I/O & Edge-Case Matrix:
+      1. Balanced entry -- 201, JournalEntry(source_type=MANUAL,
+         source_lease_transaction_id=None) + LedgerLines created.
+      2. Unbalanced entry -- 400, no rows created.
+      3. Fewer than two lines -- 400, no rows created.
+      4. Account from a different PMC -- 400, no rows created.
+      5. Missing/invalid pmc_id -- 400.
+      6. No FinancePMCProfile for pmc_id -- 404.
+      7. Caller not authorized for the PMC -- 403.
+
+    Plus: a manual entry's debit/credit is included in Trial Balance
+    identically to a posting-engine entry (spec Always -- no report
+    special-cases source_type), and `memo` round-trips end to end (the
+    field this story's first implementation pass silently dropped).
+    """
+
+    def _url(self):
+        return reverse("create-manual-journal-entry")
+
+    def _get_url(self):
+        return reverse("create-manual-journal-entry")
+
+    # Inherited from TrialBalanceReportTests but not applicable here: this
+    # endpoint is POST-based with a different request/response shape
+    # (manual-entry lines, not a report). Skipped rather than deleted, to
+    # keep the inheritance-for-fixture-reuse pattern's intent explicit
+    # (matches ProfitLossReportTests' precedent above).
+    def test_happy_path_returns_every_account_balanced_true(self):
+        self.skipTest("superseded by manual-entry-shaped happy-path test below")
+
+    def test_zero_activity_account_included_with_zero_totals(self):
+        self.skipTest("not applicable -- no report/zero-activity concept here")
+
+    def test_reversal_entry_summed_unconditionally(self):
+        self.skipTest("not applicable -- this endpoint does not post reversals")
+
+    def test_unreachable_pmc_id_rejected_with_403(self):
+        self.skipTest("superseded by test_unauthorized_pmc_rejected_with_403 below")
+
+    def test_missing_date_range_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_invalid_date_format_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_inverted_date_range_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_unauthenticated_request_rejected_with_401_before_any_query(self):
+        self.skipTest(
+            "superseded by test_unauthenticated_request_rejected_with_401 below"
+        )
+
+    def test_expired_token_rejected_with_401(self):
+        self.skipTest(
+            "covered by test_unauthenticated_request_rejected_with_401 below "
+            "via the same auth helper Trial Balance itself uses -- no "
+            "manual-entries-specific expiry behavior to re-verify"
+        )
+
+    def test_balanced_entry_creates_manual_journal_entry(self):
+        profile = self._make_profile(pmc_id=30)
+        token = self._make_token("owner30@example.com")
+        self._make_owner_with_pmc(
+            30, "owner30@example.com", token, 230, unit_id=40, property_id=50, pmc_id=30
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 30,
+                "memo": "Petty cash correction",
+                "lines": [
+                    {"account_id": bank.id, "debit": "150.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "150.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["content"]["source_type"], "MANUAL")
+        self.assertEqual(body["content"]["memo"], "Petty cash correction")
+
+        entry = JournalEntry.objects.get(pk=body["content"]["journal_entry_id"])
+        self.assertEqual(entry.source_type, JournalEntry.MANUAL)
+        self.assertIsNone(entry.source_lease_transaction_id)
+        self.assertEqual(entry.memo, "Petty cash correction")
+        self.assertEqual(entry.lines.count(), 2)
+
+    def test_unbalanced_entry_rejected_with_400_no_rows_created(self):
+        profile = self._make_profile(pmc_id=31)
+        token = self._make_token("owner31@example.com")
+        self._make_owner_with_pmc(
+            31, "owner31@example.com", token, 231, unit_id=41, property_id=51, pmc_id=31
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 31,
+                "lines": [
+                    {"account_id": bank.id, "debit": "150.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "100.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_fewer_than_two_lines_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=32)
+        token = self._make_token("owner32@example.com")
+        self._make_owner_with_pmc(
+            32, "owner32@example.com", token, 232, unit_id=42, property_id=52, pmc_id=32
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 32,
+                "lines": [{"account_id": bank.id, "debit": "50.00", "credit": "0.00"}],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_account_from_different_pmc_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=33)
+        other_profile = self._make_profile(pmc_id=34)
+        token = self._make_token("owner33@example.com")
+        self._make_owner_with_pmc(
+            33, "owner33@example.com", token, 233, unit_id=43, property_id=53, pmc_id=33
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        other_rent_income = Account.objects.get(
+            finance_pmc_profile=other_profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 33,
+                "lines": [
+                    {"account_id": bank.id, "debit": "50.00", "credit": "0.00"},
+                    {
+                        "account_id": other_rent_income.id,
+                        "debit": "0.00",
+                        "credit": "50.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=other_profile).count(), 0
+        )
+
+    def test_missing_pmc_id_rejected_with_400(self):
+        token = self._make_token("owner35@example.com")
+        self._make_owner_with_pmc(
+            35, "owner35@example.com", token, 235, unit_id=49, property_id=59, pmc_id=35
+        )
+
+        response = self.client.post(
+            self._url(),
+            {"lines": [{"account_id": 1, "debit": "10.00", "credit": "0.00"}]},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_nonexistent_pmc_id_rejected_with_404(self):
+        token = self._make_token("owner36@example.com")
+        self._make_owner_with_pmc(
+            36, "owner36@example.com", token, 236, unit_id=44, property_id=54, pmc_id=999
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 999,
+                "lines": [
+                    {"account_id": 1, "debit": "10.00", "credit": "0.00"},
+                    {"account_id": 2, "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_unauthorized_pmc_rejected_with_403(self):
+        self._make_profile(pmc_id=37)
+        token = self._make_token("owner37@example.com")
+        # Owner is scoped to pmc_id=38, not pmc_id=37.
+        self._make_owner_with_pmc(
+            37, "owner37@example.com", token, 237, unit_id=45, property_id=55, pmc_id=38
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 37,
+                "lines": [
+                    {"account_id": 1, "debit": "10.00", "credit": "0.00"},
+                    {"account_id": 2, "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_unauthenticated_request_rejected_with_401(self):
+        self._make_profile(pmc_id=39)
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 39,
+                "lines": [
+                    {"account_id": 1, "debit": "10.00", "credit": "0.00"},
+                    {"account_id": 2, "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_manual_entry_included_in_trial_balance_like_posting_engine_entry(self):
+        """spec Always: 'no report special-cases source_type'."""
+        profile = self._make_profile(pmc_id=40)
+        token = self._make_token("owner40@example.com")
+        self._make_owner_with_pmc(
+            40, "owner40@example.com", token, 240, unit_id=46, property_id=56, pmc_id=40
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        create_response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 40,
+                "lines": [
+                    {"account_id": bank.id, "debit": "300.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "300.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(create_response.status_code, 201)
+
+        entry = JournalEntry.objects.get(
+            pk=create_response.json()["content"]["journal_entry_id"]
+        )
+        entry_date = entry.posted_at.date().isoformat()
+
+        trial_balance_response = self.client.get(
+            reverse("trial-balance-report"),
+            {"pmc_id": 40, "start_date": entry_date, "end_date": entry_date},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(trial_balance_response.status_code, 200)
+        accounts = {
+            a["name"]: a
+            for a in trial_balance_response.json()["content"]["accounts"]
+        }
+        self.assertEqual(accounts["Bank"]["total_debit"], 300.0)
+        self.assertEqual(accounts["Rent Income"]["total_credit"], 300.0)
+
+    def test_manual_entry_included_in_profit_loss_like_posting_engine_entry(self):
+        """Post-review addition (verification-gap finding): only Trial
+        Balance was previously checked -- P&L reuses compute_trial_balance
+        internally, but nothing asserted a MANUAL entry actually surfaces
+        there too."""
+        profile = self._make_profile(pmc_id=43)
+        token = self._make_token("owner43@example.com")
+        self._make_owner_with_pmc(
+            43, "owner43@example.com", token, 243, unit_id=50, property_id=60, pmc_id=43
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        create_response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 43,
+                "lines": [
+                    {"account_id": bank.id, "debit": "500.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "500.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(create_response.status_code, 201)
+
+        entry = JournalEntry.objects.get(
+            pk=create_response.json()["content"]["journal_entry_id"]
+        )
+        entry_date = entry.posted_at.date().isoformat()
+
+        pl_response = self.client.get(
+            reverse("profit-loss-report"),
+            {"pmc_id": 43, "start_date": entry_date, "end_date": entry_date},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(pl_response.status_code, 200)
+        income_accounts = {
+            a["name"]: a for a in pl_response.json()["content"]["income_accounts"]
+        }
+        self.assertEqual(income_accounts["Rent Income"]["total_credit"], 500.0)
+        self.assertEqual(pl_response.json()["content"]["net_profit_loss"], 500.0)
+
+    def test_manual_entry_included_in_balance_sheet_like_posting_engine_entry(self):
+        """Post-review addition (verification-gap finding): same gap as
+        P&L -- Balance Sheet reuses compute_trial_balance internally but
+        was never checked to actually include a MANUAL entry."""
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=44)
+        FinancePMCProfile.objects.filter(pk=profile.pk).update(
+            created=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        )
+        profile.refresh_from_db()
+        token = self._make_token("owner44@example.com")
+        self._make_owner_with_pmc(
+            44, "owner44@example.com", token, 244, unit_id=51, property_id=61, pmc_id=44
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        create_response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 44,
+                "lines": [
+                    {"account_id": bank.id, "debit": "200.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "200.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(create_response.status_code, 201)
+
+        bs_response = self.client.get(
+            reverse("balance-sheet-report"),
+            {"pmc_id": 44, "as_of_date": "2026-12-31"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(bs_response.status_code, 200)
+        content = bs_response.json()["content"]
+        bank_row = next(a for a in content["asset_accounts"] if a["name"] == "Bank")
+        self.assertEqual(bank_row["balance"], 200.0)
+        self.assertTrue(content["balanced"])
+
+    def test_negative_debit_rejected_with_400_no_rows_created(self):
+        profile = self._make_profile(pmc_id=45)
+        token = self._make_token("owner45@example.com")
+        self._make_owner_with_pmc(
+            45, "owner45@example.com", token, 245, unit_id=52, property_id=62, pmc_id=45
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 45,
+                "lines": [
+                    {"account_id": bank.id, "debit": "-50.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "-50.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_line_with_both_debit_and_credit_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=46)
+        token = self._make_token("owner46@example.com")
+        self._make_owner_with_pmc(
+            46, "owner46@example.com", token, 246, unit_id=53, property_id=63, pmc_id=46
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 46,
+                "lines": [
+                    {"account_id": bank.id, "debit": "50.00", "credit": "50.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "50.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_all_zero_value_entry_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=47)
+        token = self._make_token("owner47@example.com")
+        self._make_owner_with_pmc(
+            47, "owner47@example.com", token, 247, unit_id=54, property_id=64, pmc_id=47
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 47,
+                "lines": [
+                    {"account_id": bank.id, "debit": "0.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "0.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_non_dict_line_item_rejected_with_400_not_500(self):
+        profile = self._make_profile(pmc_id=48)
+        token = self._make_token("owner48@example.com")
+        self._make_owner_with_pmc(
+            48, "owner48@example.com", token, 248, unit_id=55, property_id=65, pmc_id=48
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 48,
+                "lines": ["not-a-dict", "also-not-a-dict"],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_non_integer_account_id_rejected_with_400_not_500(self):
+        profile = self._make_profile(pmc_id=49)
+        token = self._make_token("owner49@example.com")
+        self._make_owner_with_pmc(
+            49, "owner49@example.com", token, 249, unit_id=56, property_id=66, pmc_id=49
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 49,
+                "lines": [
+                    {"account_id": "not-an-int", "debit": "10.00", "credit": "0.00"},
+                    {"account_id": "also-not-an-int", "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_list_endpoint_returns_created_manual_entry_with_memo(self):
+        profile = self._make_profile(pmc_id=41)
+        token = self._make_token("owner41@example.com")
+        self._make_owner_with_pmc(
+            41, "owner41@example.com", token, 241, unit_id=47, property_id=57, pmc_id=41
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        self.client.post(
+            self._url(),
+            {
+                "pmc_id": 41,
+                "memo": "Owner deposit",
+                "lines": [
+                    {"account_id": bank.id, "debit": "75.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "75.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        list_response = self.client.get(
+            self._get_url(),
+            {"pmc_id": 41},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        entries = list_response.json()["content"]["entries"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["memo"], "Owner deposit")
+
+    def test_no_trailing_slash_url_also_works(self):
+        profile = self._make_profile(pmc_id=42)
+        token = self._make_token("owner42@example.com")
+        self._make_owner_with_pmc(
+            42, "owner42@example.com", token, 242, unit_id=48, property_id=58, pmc_id=42
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            reverse("create-manual-journal-entry-no-slash"),
+            {
+                "pmc_id": 42,
+                "lines": [
+                    {"account_id": bank.id, "debit": "10.00", "credit": "0.00"},
+                    {"account_id": rent_income.id, "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)

@@ -40,6 +40,7 @@ from ledger.models import (
     LeaseRef,
     LeaseTransactionRef,
 )
+from ledger.manual_entries import ManualEntryValidationError, post_manual_entry
 from ledger.org_scope import get_pmc_ids_for_user_profile
 from ledger.posting import (
     RENT_CHEQUE,
@@ -1189,5 +1190,214 @@ def finance_pmc_profile_status(request, pmc_id):
     return prepare_response(
         content={"pmc_id": pmc_id, "status": status_value},
         message="Finance activation status resolved",
+        status=200,
+    )
+
+
+@api_view(["POST", "GET"])
+def create_manual_journal_entry(request):
+    """Story 5.1: `POST /ledger/manual-entries` (FR-16); also dispatches
+    `GET /ledger/manual-entries` to `_list_manual_journal_entries` so the
+    frontend's list+create page (spec's "landing on a form to add a manual
+    entry and a list of previously entered manual entries") has a single
+    URL to call against, matching the trailing-slash + no-slash route pair
+    registered once in `finance_service/urls.py` (spec Code Map).
+
+    `pmc_id` and `lines` (a list of `{account_id, debit, credit}` dicts,
+    at least two) are required; `memo` is optional. Same auth ->
+    parse/validate -> resolve-profile -> scope-check sequence as
+    `chart_of_accounts` (spec Code Map):
+      1. Auth (`authenticate_reporting_request`) -- 401 on any rejection,
+         before any query runs.
+      2. Parse/validate `pmc_id` -- 400 on failure, matching the existing
+         `chart_of_accounts` param-validation shape (spec I/O matrix).
+      3. Resolve `FinancePMCProfile` by `pmc_id` -- 404 if none exists,
+         matching the existing `chart_of_accounts` 404 shape.
+      4. Scope check (`get_pmc_ids_for_user_profile`) -- 403 if the
+         requested `pmc_id` is not in the caller's reachable PMCs.
+      5. Delegate to `post_manual_entry` -- 400 (no rows created) on any
+         `ManualEntryValidationError` (unbalanced entry, fewer than two
+         lines, or an account_id outside this PMC); 201 on success.
+    """
+    if request.method == "GET":
+        # Calls the plain (undecorated) implementation directly -- wrapping
+        # it in its own `@api_view` would re-wrap the already-DRF-wrapped
+        # `request` this view's own decorator produced, raising
+        # `AssertionError` (confirmed via a live GET against the running
+        # dev server -- caught by manual verification, not the automated
+        # test suite, spec Verification). No separate list view is
+        # registered in `urls.py` -- this is the only entry point.
+        return _list_manual_journal_entries(request)
+
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.data.get("pmc_id")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    if pmc_id is None:
+        return prepare_response(
+            content={"pmc_id": raw_pmc_id},
+            message="pmc_id is required",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to post manual entries for this PMC",
+            status=403,
+        )
+
+    lines = request.data.get("lines")
+    memo = request.data.get("memo", "") or ""
+
+    if not isinstance(lines, list):
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="At least two lines are required",
+            status=400,
+        )
+
+    try:
+        entry = post_manual_entry(finance_pmc_profile, lines, memo=memo)
+    except ManualEntryValidationError as exc:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message=exc.message,
+            status=400,
+        )
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "journal_entry_id": entry.id,
+            "source_type": entry.source_type,
+            "memo": entry.memo,
+            "lines": [
+                {
+                    "account_id": line.account_id,
+                    "account_name": line.account.name,
+                    "debit": str(line.debit),
+                    "credit": str(line.credit),
+                }
+                for line in entry.lines.all()
+            ],
+        },
+        message="Manual journal entry posted",
+        status=201,
+    )
+
+
+def _list_manual_journal_entries(request):
+    """Story 5.1: list existing manual entries for a PMC, backing the
+    frontend's Manual Entries list view. Plain (undecorated) function,
+    called directly by `create_manual_journal_entry`'s own GET dispatch
+    (which already holds a DRF `Request`; wrapping this in its own
+    `@api_view` would re-wrap it and raise `AssertionError`, confirmed via
+    manual verification) -- the only entry point, no separate list view is
+    registered in `urls.py`.
+
+    Not itself an Acceptance Criterion line item, but required by the
+    story's own "a list of previously entered manual entries for the
+    active FinancePMCProfile" acceptance criterion -- there is otherwise no
+    way for the frontend to render that list. Same auth ->
+    parse/validate -> resolve-profile -> scope-check sequence as every
+    other Finance reporting endpoint (spec Always); returned whole, never
+    paginated -- a PMC's manual-entry volume is expected to be small
+    relative to the naturally-growing all-entries view Story 5.7 will add
+    (out of scope here, spec Never).
+    """
+    user_profile_ref, reason = authenticate_reporting_request(request)
+    if user_profile_ref is None:
+        return prepare_response(
+            content={"reason": reason},
+            message="Authentication failed",
+            status=401,
+        )
+
+    raw_pmc_id = request.query_params.get("pmc_id")
+
+    pmc_id = None
+    if raw_pmc_id is not None:
+        try:
+            pmc_id = int(raw_pmc_id)
+        except (TypeError, ValueError):
+            pmc_id = None
+
+    if pmc_id is None:
+        return prepare_response(
+            content={"pmc_id": raw_pmc_id},
+            message="pmc_id is required",
+            status=400,
+        )
+
+    finance_pmc_profile = FinancePMCProfile.objects.filter(pmc_id=pmc_id).first()
+    if finance_pmc_profile is None:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="No FinancePMCProfile exists for the given pmc_id",
+            status=404,
+        )
+
+    reachable_pmc_ids = get_pmc_ids_for_user_profile(user_profile_ref)
+    if pmc_id not in reachable_pmc_ids:
+        return prepare_response(
+            content={"pmc_id": pmc_id},
+            message="You are not authorized to view manual entries for this PMC",
+            status=403,
+        )
+
+    entries = (
+        JournalEntry.objects.filter(
+            finance_pmc_profile=finance_pmc_profile,
+            source_type=JournalEntry.MANUAL,
+        )
+        .prefetch_related("lines__account")
+        .order_by("-posted_at", "-id")
+    )
+
+    return prepare_response(
+        content={
+            "pmc_id": pmc_id,
+            "entries": [
+                {
+                    "id": entry.id,
+                    "posted_at": entry.posted_at.isoformat(),
+                    "memo": entry.memo,
+                    "lines": [
+                        {
+                            "account_id": line.account_id,
+                            "account_name": line.account.name,
+                            "debit": str(line.debit),
+                            "credit": str(line.credit),
+                        }
+                        for line in entry.lines.all()
+                    ],
+                }
+                for entry in entries
+            ],
+        },
+        message="Manual journal entries retrieved",
         status=200,
     )

@@ -112,7 +112,25 @@ class JournalEntry(models.Model):
     precedent — it references units-backend's `LeaseTransaction` row, which
     lives in a different Django project's migration set despite sharing the
     same Postgres instance (AD-2).
+
+    Story 5.1 (FR-16) makes `source_lease_transaction_id` nullable and adds
+    `source_type`, so a manual, free-form entry (no originating
+    `LeaseTransaction`) can coexist with posting-engine entries: a manual
+    entry always has `source_type=MANUAL` and
+    `source_lease_transaction_id=None`, and that field's presence always
+    implies `source_type=LEASE_TRANSACTION` (spec Never — mutual exclusivity
+    enforced at the model/serializer level, not just convention).
+    `source_type` defaults to `LEASE_TRANSACTION` so every existing row
+    backfills correctly without a data migration (spec Code Map).
     """
+
+    LEASE_TRANSACTION = "LEASE_TRANSACTION"
+    MANUAL = "MANUAL"
+
+    SOURCE_TYPE_CHOICES = [
+        (LEASE_TRANSACTION, "Lease Transaction"),
+        (MANUAL, "Manual"),
+    ]
 
     finance_pmc_profile = models.ForeignKey(
         FinancePMCProfile,
@@ -120,12 +138,34 @@ class JournalEntry(models.Model):
         related_name="journal_entries",
     )
     source_lease_transaction_id = models.BigIntegerField(
-        help_text="units-backend LeaseTransaction.id — not a cross-DB FK (AD-19 precedent)."
+        null=True,
+        blank=True,
+        help_text="units-backend LeaseTransaction.id — not a cross-DB FK "
+        "(AD-19 precedent). Null for source_type=MANUAL entries (FR-16).",
+    )
+    source_type = models.CharField(
+        max_length=20,
+        choices=SOURCE_TYPE_CHOICES,
+        default=LEASE_TRANSACTION,
+        help_text="Discriminates posting-engine entries (LEASE_TRANSACTION, "
+        "the default) from operator-entered ones (MANUAL, Story 5.1/FR-16).",
     )
     source_status_transition = models.CharField(
         max_length=100,
+        blank=True,
+        default="",
         help_text="Exact FROM_STATUS->TO_STATUS pair; idempotency key with "
-        "source_lease_transaction_id (AD-14).",
+        "source_lease_transaction_id (AD-14). Not applicable to manual "
+        "entries (source_type=MANUAL) -- left blank, never fabricated "
+        "(spec Always).",
+    )
+    memo = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Optional operator-entered note for a manual entry "
+        "(source_type=MANUAL, Story 5.1/FR-16). Always blank for "
+        "posting-engine entries -- no story populates it for those.",
     )
     reversed_journal_entry = models.ForeignKey(
         "self",
