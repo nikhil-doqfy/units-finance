@@ -91,6 +91,7 @@ has been posted (spec Design Notes). Instead:
     nothing, wait) -- not a failure (spec Boundaries & Constraints).
 """
 import logging
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
 
@@ -159,7 +160,13 @@ AP_PMC_COMMISSION_ACCOUNT_NAME = "AP — PMC Commission"
 # Story 2.7's flat UAE VAT rate, applied directly to the computed commission
 # amount -- no Charge row is ever created or read for this VAT (spec Never;
 # matches the seeded PMC's UAE-only Phase 1 scope, Design Notes).
+#
+# Story 5.5 reuses this same 5% rate for rent VAT (spec Always: "reuse the
+# existing COMMISSION_VAT_RATE ... never a second, independently-defined
+# 5%") -- VAT_RATE is a plain alias, not a second definition, so the two
+# postings can never drift onto different rates.
 COMMISSION_VAT_RATE = 0.05
+VAT_RATE = COMMISSION_VAT_RATE
 
 # Story 2.7's idempotency key suffix -- parallel to post_rent_ar's own
 # CREATE_STATUS_TRANSITION, but distinguishable so the two postings never
@@ -214,6 +221,32 @@ def _bounce_fee_transition(bounced_transaction_id):
 # always "CREATE-<something>", exactly one per id since post_rent_ar posts
 # once, guarded by its own idempotency check.
 CREATE_TRANSITION_PREFIX = "CREATE-"
+
+
+def _rent_vat_amount(amount):
+    """Return the 5% VAT portion of a base rent `amount`, rounded to 2
+    decimal places (spec Always: rounding is applied consistently at the
+    point of calculation, matching this codebase's existing money-rounding
+    precision)."""
+    return (Decimal(str(amount)) * Decimal(str(VAT_RATE))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+
+
+def _rent_ar_total_with_vat(amount):
+    """Return the VAT-inclusive AR total (`amount + 5% VAT`) for a base rent
+    `amount`, rounded to 2 decimal places.
+
+    Shared by `post_rent_ar`, `post_cheque_clearing`, and
+    `post_bounce_reversal` (spec Always/Boundaries & Constraints) -- the
+    single source of truth for the VAT-inclusive total, so AR never carries
+    a stray unresolved balance through the post -> clear/bounce lifecycle
+    from three independent recomputations drifting apart.
+    """
+    base = Decimal(str(amount))
+    return (base + _rent_vat_amount(amount)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
 
 
 def post_rent_ar(lease_transaction_id, txn=None):
@@ -324,6 +357,13 @@ def post_rent_ar(lease_transaction_id, txn=None):
 
     amount = txn.amount
 
+    # Story 5.5: VAT is additional, on top of the base rent -- `amount`
+    # (LeaseTransactionRef.amount) stays the base rent principal and is
+    # never mutated; the VAT-inclusive AR total and the VAT portion are
+    # both derived via the shared helpers (spec Always/Never).
+    vat_amount = _rent_vat_amount(amount)
+    ar_total = _rent_ar_total_with_vat(amount)
+
     try:
         ar_account = Account.objects.get(
             finance_pmc_profile=profile, name=AR_TENANTS_ACCOUNT_NAME
@@ -331,15 +371,19 @@ def post_rent_ar(lease_transaction_id, txn=None):
         rent_income_account = Account.objects.get(
             finance_pmc_profile=profile, name=RENT_INCOME_ACCOUNT_NAME
         )
+        vat_payable_account = Account.objects.get(
+            finance_pmc_profile=profile, name=VAT_PAYABLE_ACCOUNT_NAME
+        )
     except Account.DoesNotExist:
         logger.error(
             "post_rent_ar: Chart of Accounts not configured for "
             "FinancePMCProfile pmc_id=%s (lease_transaction_id=%s) -- "
-            "expected Accounts named %r and %r",
+            "expected Accounts named %r, %r and %r",
             profile.pmc_id,
             lease_transaction_id,
             AR_TENANTS_ACCOUNT_NAME,
             RENT_INCOME_ACCOUNT_NAME,
+            VAT_PAYABLE_ACCOUNT_NAME,
         )
         return {"posted": False, "reason": "chart_of_accounts_not_configured"}
 
@@ -353,7 +397,7 @@ def post_rent_ar(lease_transaction_id, txn=None):
         LedgerLine.objects.create(
             journal_entry=entry,
             account=ar_account,
-            debit=amount,
+            debit=ar_total,
             credit=0,
         )
         LedgerLine.objects.create(
@@ -362,10 +406,16 @@ def post_rent_ar(lease_transaction_id, txn=None):
             debit=0,
             credit=amount,
         )
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=vat_payable_account,
+            debit=0,
+            credit=vat_amount,
+        )
 
         debit_total = sum(line.debit for line in entry.lines.all())
         credit_total = sum(line.credit for line in entry.lines.all())
-        if debit_total != credit_total or debit_total != amount:
+        if debit_total != credit_total or debit_total != ar_total:
             # A real conditional, not `assert` -- `assert` is stripped
             # entirely under Python's `-O` flag, which some Gunicorn
             # deployments use; this balance invariant must hold even then
@@ -373,16 +423,18 @@ def post_rent_ar(lease_transaction_id, txn=None):
             raise ValueError(
                 f"post_rent_ar: unbalanced entry for lease_transaction_id="
                 f"{lease_transaction_id} (debit={debit_total}, "
-                f"credit={credit_total}, amount={amount})"
+                f"credit={credit_total}, ar_total={ar_total})"
             )
 
     logger.info(
         "post_rent_ar: posted JournalEntry id=%s for lease_transaction_id=%s "
-        "(pmc_id=%s, amount=%s)",
+        "(pmc_id=%s, amount=%s, vat_amount=%s, ar_total=%s)",
         entry.id,
         lease_transaction_id,
         profile.pmc_id,
         amount,
+        vat_amount,
+        ar_total,
     )
     return {"posted": True, "reason": ""}
 
@@ -527,7 +579,11 @@ def post_cheque_clearing(lease_transaction_id, txn=None):
         )
         return {"posted": False, "reason": "unresolvable_pmc"}
 
-    amount = txn.amount
+    # Story 5.5: clear the VAT-inclusive total post_rent_ar posted to AR
+    # (via the same shared helper), not the raw base `amount` -- otherwise
+    # AR would permanently carry the VAT portion as a stray unresolved
+    # balance after this cheque clears (spec Always).
+    amount = _rent_ar_total_with_vat(txn.amount)
 
     try:
         bank_account = Account.objects.get(
@@ -751,11 +807,13 @@ def post_bounce_reversal(lease_transaction_id, txn=None):
         )
         return {"posted": False, "reason": "unresolvable_pmc"}
 
-    # Reversal amount always matches the ORIGINAL Rent AR posting's amount
-    # for this lease_transaction_id -- read from LeaseTransactionRef.amount
-    # (same field, same value, consistent with Stories 2.2b/2.3's
-    # convention), not recomputed (spec Boundaries & Constraints).
-    amount = txn.amount
+    # Reversal amount always matches the ORIGINAL Rent AR posting's total
+    # for this lease_transaction_id -- Story 5.5: the VAT-inclusive total
+    # via the same shared helper post_rent_ar/post_cheque_clearing use, not
+    # the raw base `amount` -- otherwise AR would permanently carry the VAT
+    # portion as a stray unresolved balance after this cheque bounces (spec
+    # Always).
+    amount = _rent_ar_total_with_vat(txn.amount)
 
     try:
         ar_account = Account.objects.get(

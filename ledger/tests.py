@@ -748,19 +748,22 @@ class PostRentArTests(TestCase):
         self.assertEqual(entry.finance_pmc_profile_id, profile.id)
 
         lines = LedgerLine.objects.filter(journal_entry=entry)
-        self.assertEqual(lines.count(), 2)
+        self.assertEqual(lines.count(), 3)
 
         ar_line = lines.get(account__name="AR — Tenants")
         income_line = lines.get(account__name="Rent Income")
-        self.assertEqual(ar_line.debit, 5000)
+        vat_line = lines.get(account__name="VAT Payable")
+        self.assertEqual(ar_line.debit, 5250)
         self.assertEqual(ar_line.credit, 0)
         self.assertEqual(income_line.debit, 0)
         self.assertEqual(income_line.credit, 5000)
+        self.assertEqual(vat_line.debit, 0)
+        self.assertEqual(vat_line.credit, 250)
 
         debit_total = sum(line.debit for line in lines)
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
-        self.assertEqual(debit_total, 5000)
+        self.assertEqual(debit_total, 5250)
 
     def test_duplicate_sync_is_skipped(self):
         self._make_profile(pmc_id=1)
@@ -902,6 +905,82 @@ class PostRentArTests(TestCase):
         self.assertEqual(
             JournalEntry.objects.filter(source_lease_transaction_id=106).count(), 0
         )
+
+    def test_vat_standard_case_1000_amount(self):
+        """Story 5.5 I/O matrix: amount=1000 -> AR debit 1050, Rent Income
+        credit 1000, VAT Payable credit 50."""
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=107,
+                lease_id=17,
+                unit_id=27,
+                property_id=37,
+                pmc_id=1,
+                amount=1000,
+            )
+
+        result = post_rent_ar(107)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=107,
+            source_status_transition="CREATE-BALANCE",
+        )
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 3)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        income_line = lines.get(account__name="Rent Income")
+        vat_line = lines.get(account__name="VAT Payable")
+        self.assertEqual(ar_line.debit, 1050)
+        self.assertEqual(income_line.credit, 1000)
+        self.assertEqual(vat_line.credit, 50)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 1050)
+
+    def test_vat_rounding_edge_case_33_33_amount(self):
+        """Story 5.5 I/O matrix rounding edge: amount=33.33 -> VAT =
+        1.6665 rounds to 1.67; AR debit = 34.9965 rounds to 35.00; entry
+        still balances (AR = Rent Income + VAT Payable exactly, both
+        rounded consistently)."""
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=108,
+                lease_id=18,
+                unit_id=28,
+                property_id=38,
+                pmc_id=1,
+                amount=33.33,
+            )
+
+        result = post_rent_ar(108)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=108,
+            source_status_transition="CREATE-BALANCE",
+        )
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 3)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        income_line = lines.get(account__name="Rent Income")
+        vat_line = lines.get(account__name="VAT Payable")
+        self.assertEqual(vat_line.credit, decimal.Decimal("1.67"))
+        self.assertEqual(ar_line.debit, decimal.Decimal("35.00"))
+        self.assertEqual(income_line.credit, decimal.Decimal("33.33"))
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, decimal.Decimal("35.00"))
 
 
 class PostChequeClearingTests(TestCase):
@@ -1073,21 +1152,31 @@ class PostChequeClearingTests(TestCase):
 
         bank_line = lines.get(account__name="Bank")
         ar_line = lines.get(account__name="AR — Tenants")
-        self.assertEqual(bank_line.debit, 5000)
+        self.assertEqual(bank_line.debit, 5250)
         self.assertEqual(bank_line.credit, 0)
         self.assertEqual(ar_line.debit, 0)
-        self.assertEqual(ar_line.credit, 5000)
+        self.assertEqual(ar_line.credit, 5250)
 
         debit_total = sum(line.debit for line in lines)
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
-        self.assertEqual(debit_total, 5000)
+        self.assertEqual(debit_total, 5250)
 
         # Exactly two JournalEntries total for this lease_transaction_id --
         # the original Rent AR posting plus this clearing posting.
         self.assertEqual(
             JournalEntry.objects.filter(source_lease_transaction_id=200).count(), 2
         )
+
+        # Story 5.5: AR nets to exactly zero across the post -> clear
+        # lifecycle -- the VAT-inclusive debit from post_rent_ar and the
+        # VAT-inclusive credit from post_cheque_clearing cancel out.
+        ar_lines_for_txn = LedgerLine.objects.filter(
+            journal_entry__source_lease_transaction_id=200,
+            account__name="AR — Tenants",
+        )
+        net_ar = sum(line.debit - line.credit for line in ar_lines_for_txn)
+        self.assertEqual(net_ar, 0)
 
     def test_two_step_clearing_posts_two_separate_journal_entries(self):
         self._make_profile(pmc_id=1)
@@ -1403,11 +1492,11 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
         )
         self.assertEqual(entry.finance_pmc_profile_id, profile.id)
         lines = LedgerLine.objects.filter(journal_entry=entry)
-        self.assertEqual(lines.count(), 2)
+        self.assertEqual(lines.count(), 3)
         debit_total = sum(line.debit for line in lines)
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
-        self.assertEqual(debit_total, 7500)
+        self.assertEqual(debit_total, 7875)
 
 
 class PostBounceReversalTests(TestCase):
@@ -1591,20 +1680,30 @@ class PostBounceReversalTests(TestCase):
         ar_line = lines.get(account__name="AR — Tenants")
         bounced_line = lines.get(account__name="Bounced Cheques")
         self.assertEqual(ar_line.debit, 0)
-        self.assertEqual(ar_line.credit, 5000)
-        self.assertEqual(bounced_line.debit, 5000)
+        self.assertEqual(ar_line.credit, 5250)
+        self.assertEqual(bounced_line.debit, 5250)
         self.assertEqual(bounced_line.credit, 0)
 
         debit_total = sum(line.debit for line in lines)
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
-        self.assertEqual(debit_total, 5000)
+        self.assertEqual(debit_total, 5250)
 
         # Exactly two JournalEntries total for this lease_transaction_id --
         # the original Rent AR posting plus this reversal.
         self.assertEqual(
             JournalEntry.objects.filter(source_lease_transaction_id=300).count(), 2
         )
+
+        # Story 5.5: AR nets to exactly zero across the post -> bounce
+        # lifecycle -- the VAT-inclusive debit from post_rent_ar and the
+        # VAT-inclusive credit from post_bounce_reversal cancel out.
+        ar_lines_for_txn = LedgerLine.objects.filter(
+            journal_entry__source_lease_transaction_id=300,
+            account__name="AR — Tenants",
+        )
+        net_ar = sum(line.debit - line.credit for line in ar_lines_for_txn)
+        self.assertEqual(net_ar, 0)
 
     def test_duplicate_sync_is_skipped(self):
         self._make_profile(pmc_id=1)
@@ -1713,12 +1812,12 @@ class PostBounceReversalTests(TestCase):
             sum(line.debit for line in lines_303),
             sum(line.credit for line in lines_303),
         )
-        self.assertEqual(sum(line.debit for line in lines_303), 2000)
+        self.assertEqual(sum(line.debit for line in lines_303), 2100)
         self.assertEqual(
             sum(line.debit for line in lines_304),
             sum(line.credit for line in lines_304),
         )
-        self.assertEqual(sum(line.debit for line in lines_304), 6000)
+        self.assertEqual(sum(line.debit for line in lines_304), 6300)
 
         # No shared idempotency state -- each id has exactly its own two
         # entries (CREATE-BALANCE + BALANCE-BOUNCED).
@@ -3537,10 +3636,6 @@ class PostCommissionSplitTests(TestCase):
 
     def test_unconfigured_chart_of_accounts_posts_nothing(self):
         profile = self._make_profile(pmc_id=1)
-        Account.objects.filter(
-            finance_pmc_profile=profile,
-            name__in=["Commission Expense", "AP — PMC Commission", "VAT Payable"],
-        ).delete()
         with connection.cursor() as cursor:
             self._insert_chain(
                 cursor,
@@ -3553,7 +3648,16 @@ class PostCommissionSplitTests(TestCase):
                 commission_percent=8,
             )
 
+        # post_rent_ar must succeed first (Story 5.5: it now also needs a
+        # VAT Payable Account for its own 3-line entry) -- only AFTER that
+        # succeeds do we delete the Accounts this test is actually about,
+        # isolating post_commission_split's own chart_of_accounts_not_configured
+        # path from post_rent_ar's.
         self.assertTrue(post_rent_ar(409)["posted"])
+        Account.objects.filter(
+            finance_pmc_profile=profile,
+            name__in=["Commission Expense", "AP — PMC Commission", "VAT Payable"],
+        ).delete()
         result = post_commission_split(409)
 
         self.assertFalse(result["posted"])
