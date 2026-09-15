@@ -91,9 +91,11 @@ has been posted (spec Design Notes). Instead:
     nothing, wait) -- not a failure (spec Boundaries & Constraints).
 """
 import logging
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
 
+from ledger.manual_entries import ManualEntryValidationError, post_manual_entry
 from ledger.models import (
     Account,
     ChargeRef,
@@ -102,6 +104,7 @@ from ledger.models import (
     LeaseRef,
     LeaseTransactionRef,
     LedgerLine,
+    PMCChargeType,
     PropertyRef,
     UnitOwnerRef,
     UnitRef,
@@ -157,7 +160,13 @@ AP_PMC_COMMISSION_ACCOUNT_NAME = "AP — PMC Commission"
 # Story 2.7's flat UAE VAT rate, applied directly to the computed commission
 # amount -- no Charge row is ever created or read for this VAT (spec Never;
 # matches the seeded PMC's UAE-only Phase 1 scope, Design Notes).
+#
+# Story 5.5 reuses this same 5% rate for rent VAT (spec Always: "reuse the
+# existing COMMISSION_VAT_RATE ... never a second, independently-defined
+# 5%") -- VAT_RATE is a plain alias, not a second definition, so the two
+# postings can never drift onto different rates.
 COMMISSION_VAT_RATE = 0.05
+VAT_RATE = COMMISSION_VAT_RATE
 
 # Story 2.7's idempotency key suffix -- parallel to post_rent_ar's own
 # CREATE_STATUS_TRANSITION, but distinguishable so the two postings never
@@ -195,6 +204,14 @@ BOUNCE_TRANSITION_SUFFIX = "-BOUNCED"
 # (other_charge_transaction_id, bounced_transaction_id) idempotency key.
 BOUNCE_FEE_TRANSITION_PREFIX = "BOUNCE_FEE-FOR-"
 
+# Story 5.2's idempotency-key transition (spec Boundaries & Constraints): a
+# fixed string, distinct from post_bounce_fee's BOUNCE_FEE-FOR-<id> family --
+# one JournalEntry per (source_lease_transaction_id, "OTHER_CHARGE-POSTED"),
+# never colliding with the bounce-fee pairing's own keys on the same
+# OTHER_CHARGE transaction id (the two paths are mutually exclusive per
+# transaction, spec Always, but the idempotency columns are shared).
+OTHER_CHARGE_POSTED_TRANSITION = "OTHER_CHARGE-POSTED"
+
 
 def _bounce_fee_transition(bounced_transaction_id):
     return f"{BOUNCE_FEE_TRANSITION_PREFIX}{bounced_transaction_id}"
@@ -204,6 +221,32 @@ def _bounce_fee_transition(bounced_transaction_id):
 # always "CREATE-<something>", exactly one per id since post_rent_ar posts
 # once, guarded by its own idempotency check.
 CREATE_TRANSITION_PREFIX = "CREATE-"
+
+
+def _rent_vat_amount(amount):
+    """Return the 5% VAT portion of a base rent `amount`, rounded to 2
+    decimal places (spec Always: rounding is applied consistently at the
+    point of calculation, matching this codebase's existing money-rounding
+    precision)."""
+    return (Decimal(str(amount)) * Decimal(str(VAT_RATE))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+
+
+def _rent_ar_total_with_vat(amount):
+    """Return the VAT-inclusive AR total (`amount + 5% VAT`) for a base rent
+    `amount`, rounded to 2 decimal places.
+
+    Shared by `post_rent_ar`, `post_cheque_clearing`, and
+    `post_bounce_reversal` (spec Always/Boundaries & Constraints) -- the
+    single source of truth for the VAT-inclusive total, so AR never carries
+    a stray unresolved balance through the post -> clear/bounce lifecycle
+    from three independent recomputations drifting apart.
+    """
+    base = Decimal(str(amount))
+    return (base + _rent_vat_amount(amount)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
 
 
 def post_rent_ar(lease_transaction_id, txn=None):
@@ -314,6 +357,13 @@ def post_rent_ar(lease_transaction_id, txn=None):
 
     amount = txn.amount
 
+    # Story 5.5: VAT is additional, on top of the base rent -- `amount`
+    # (LeaseTransactionRef.amount) stays the base rent principal and is
+    # never mutated; the VAT-inclusive AR total and the VAT portion are
+    # both derived via the shared helpers (spec Always/Never).
+    vat_amount = _rent_vat_amount(amount)
+    ar_total = _rent_ar_total_with_vat(amount)
+
     try:
         ar_account = Account.objects.get(
             finance_pmc_profile=profile, name=AR_TENANTS_ACCOUNT_NAME
@@ -321,15 +371,19 @@ def post_rent_ar(lease_transaction_id, txn=None):
         rent_income_account = Account.objects.get(
             finance_pmc_profile=profile, name=RENT_INCOME_ACCOUNT_NAME
         )
+        vat_payable_account = Account.objects.get(
+            finance_pmc_profile=profile, name=VAT_PAYABLE_ACCOUNT_NAME
+        )
     except Account.DoesNotExist:
         logger.error(
             "post_rent_ar: Chart of Accounts not configured for "
             "FinancePMCProfile pmc_id=%s (lease_transaction_id=%s) -- "
-            "expected Accounts named %r and %r",
+            "expected Accounts named %r, %r and %r",
             profile.pmc_id,
             lease_transaction_id,
             AR_TENANTS_ACCOUNT_NAME,
             RENT_INCOME_ACCOUNT_NAME,
+            VAT_PAYABLE_ACCOUNT_NAME,
         )
         return {"posted": False, "reason": "chart_of_accounts_not_configured"}
 
@@ -343,7 +397,7 @@ def post_rent_ar(lease_transaction_id, txn=None):
         LedgerLine.objects.create(
             journal_entry=entry,
             account=ar_account,
-            debit=amount,
+            debit=ar_total,
             credit=0,
         )
         LedgerLine.objects.create(
@@ -352,10 +406,16 @@ def post_rent_ar(lease_transaction_id, txn=None):
             debit=0,
             credit=amount,
         )
+        LedgerLine.objects.create(
+            journal_entry=entry,
+            account=vat_payable_account,
+            debit=0,
+            credit=vat_amount,
+        )
 
         debit_total = sum(line.debit for line in entry.lines.all())
         credit_total = sum(line.credit for line in entry.lines.all())
-        if debit_total != credit_total or debit_total != amount:
+        if debit_total != credit_total or debit_total != ar_total:
             # A real conditional, not `assert` -- `assert` is stripped
             # entirely under Python's `-O` flag, which some Gunicorn
             # deployments use; this balance invariant must hold even then
@@ -363,16 +423,18 @@ def post_rent_ar(lease_transaction_id, txn=None):
             raise ValueError(
                 f"post_rent_ar: unbalanced entry for lease_transaction_id="
                 f"{lease_transaction_id} (debit={debit_total}, "
-                f"credit={credit_total}, amount={amount})"
+                f"credit={credit_total}, ar_total={ar_total})"
             )
 
     logger.info(
         "post_rent_ar: posted JournalEntry id=%s for lease_transaction_id=%s "
-        "(pmc_id=%s, amount=%s)",
+        "(pmc_id=%s, amount=%s, vat_amount=%s, ar_total=%s)",
         entry.id,
         lease_transaction_id,
         profile.pmc_id,
         amount,
+        vat_amount,
+        ar_total,
     )
     return {"posted": True, "reason": ""}
 
@@ -517,7 +579,11 @@ def post_cheque_clearing(lease_transaction_id, txn=None):
         )
         return {"posted": False, "reason": "unresolvable_pmc"}
 
-    amount = txn.amount
+    # Story 5.5: clear the VAT-inclusive total post_rent_ar posted to AR
+    # (via the same shared helper), not the raw base `amount` -- otherwise
+    # AR would permanently carry the VAT portion as a stray unresolved
+    # balance after this cheque clears (spec Always).
+    amount = _rent_ar_total_with_vat(txn.amount)
 
     try:
         bank_account = Account.objects.get(
@@ -741,11 +807,13 @@ def post_bounce_reversal(lease_transaction_id, txn=None):
         )
         return {"posted": False, "reason": "unresolvable_pmc"}
 
-    # Reversal amount always matches the ORIGINAL Rent AR posting's amount
-    # for this lease_transaction_id -- read from LeaseTransactionRef.amount
-    # (same field, same value, consistent with Stories 2.2b/2.3's
-    # convention), not recomputed (spec Boundaries & Constraints).
-    amount = txn.amount
+    # Reversal amount always matches the ORIGINAL Rent AR posting's total
+    # for this lease_transaction_id -- Story 5.5: the VAT-inclusive total
+    # via the same shared helper post_rent_ar/post_cheque_clearing use, not
+    # the raw base `amount` -- otherwise AR would permanently carry the VAT
+    # portion as a stray unresolved balance after this cheque bounces (spec
+    # Always).
+    amount = _rent_ar_total_with_vat(txn.amount)
 
     try:
         ar_account = Account.objects.get(
@@ -1557,6 +1625,294 @@ def post_commission_split(lease_transaction_id, txn=None):
         rent_amount,
         commission_percent,
         commission_amount,
+        vat_amount,
+    )
+    return {"posted": True, "reason": ""}
+
+
+"""
+Story 5.2: PMC charge types post to the ledger (non-bounce OTHER_CHARGE
+transactions), FR-17.
+
+`post_other_charge` handles the sibling gap `post_bounce_fee` (Story 2.5)
+deliberately leaves open: an `OTHER_CHARGE` `LeaseTransaction` with NO
+unresolved bounce on its lease (e.g. an operator raising a standalone
+maintenance/security charge) previously posted nothing at all. This
+function is called from `sync_lease_transaction` after `post_bounce_fee`,
+ONLY when `post_bounce_fee`'s own result reason is `no_unresolved_bounce`
+(spec Boundaries & Constraints) -- it never runs alongside a successful
+`post_bounce_fee` post, and it never modifies `post_bounce_fee` itself or
+its bounce-pairing logic (spec Never).
+
+Gate (spec Boundaries & Constraints): `txn.cheque_type == OTHER_CHARGE`,
+`txn.charge_id` is not null, AND `post_bounce_fee`'s own bounce-pairing
+check (`bounced_ids_on_lease`) finds no unresolved bounce on the lease --
+reused verbatim here, not re-derived, so the two paths can never disagree
+about what counts as "no bounce to pair with."
+
+Resolution: the same PMC-resolution chain every other posting function in
+this module uses (`LeaseTransactionRef.lease_id` -> `LeaseRef.unit_id` ->
+`UnitRef.parent_property_id` -> `PropertyRef.pmc_id` -> `FinancePMCProfile`),
+then a `PMCChargeType` lookup for `(profile, txn.charge_id)`. Missing or
+inactive is a fail-loud, no-partial-post outcome (spec Always) -- never a
+silent skip, unlike `post_bounce_fee`'s genuine "no bounce yet" no-op.
+
+Posting mechanics: reuses Story 5.1's `post_manual_entry` (spec Code Map),
+constructing a balanced `JournalEntry(source_type=MANUAL)` debiting
+AR — Tenants and crediting the mapped Account for `ChargeRef.amount`, plus
+a VAT Payable line when `ChargeRef.vat_amount` is nonzero -- mirroring
+`post_bounce_fee`'s own AR-debit-equals-fee-plus-VAT balance framing.
+
+Idempotency key: `(source_lease_transaction_id, "OTHER_CHARGE-POSTED")` --
+a fixed string, distinct from post_bounce_fee's `BOUNCE_FEE-FOR-<id>`
+family, since this story's trigger has no bounce to encode a pairing
+against (spec Always).
+"""
+
+AR_ACCOUNT_NAME_FOR_OTHER_CHARGE = AR_TENANTS_ACCOUNT_NAME
+VAT_PAYABLE_ACCOUNT_NAME_FOR_OTHER_CHARGE = VAT_PAYABLE_ACCOUNT_NAME
+
+
+def post_other_charge(lease_transaction_id, txn=None):
+    """Post a balanced manual-style Journal Entry for a non-bounce
+    OTHER_CHARGE LeaseTransaction, crediting the operator-configured
+    PMCChargeType Account and debiting AR — Tenants.
+
+    `txn` may be passed in by a caller that has already fetched the
+    `LeaseTransactionRef` (mirrors every other posting function's `txn`
+    param in this module) -- avoids a second, redundant query for the same
+    row. If omitted, this function fetches it itself.
+
+    Must only be called after `post_bounce_fee(lease_transaction_id, ...)`
+    has itself returned `{"posted": False, "reason": "no_unresolved_bounce"}`
+    for this same lease_transaction_id (spec Boundaries & Constraints) --
+    this function does not re-check that itself beyond re-running the same
+    `bounced_ids_on_lease` emptiness check `post_bounce_fee` already does,
+    so a direct/test caller invoking this function on its own still gets
+    the correct gating behavior.
+
+    Returns a dict: {"posted": bool, "reason": str} -- same shape/contract
+    as every other posting function here. Never raises for an expected
+    failure path; only a genuinely unexpected DB error propagates out of
+    the atomic block (via `post_manual_entry`'s own atomic block).
+    """
+    if txn is None:
+        # `created` lives only on units-backend's parent `Documents` table
+        # (MTI: `LeaseTransaction(Documents)`), not on `lease_leasetransaction`
+        # itself -- deferred here since this function never reads it, and
+        # selecting it would 500 with `column lease_leasetransaction.created
+        # does not exist`.
+        txn = (
+            LeaseTransactionRef.objects.filter(pk=lease_transaction_id)
+            .defer("created")
+            .first()
+        )
+    if txn is None:
+        logger.error(
+            "post_other_charge: no LeaseTransaction found for id=%s -- "
+            "cannot post",
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "lease_transaction_not_found"}
+
+    if txn.cheque_type != OTHER_CHARGE or not txn.charge_id:
+        # Not this story's trigger -- correctly a no-op, not a failure.
+        return {"posted": False, "reason": "not_other_charge_type"}
+
+    # Reuse post_bounce_fee's own bounce-pairing emptiness check verbatim
+    # (spec Boundaries & Constraints: "reuse post_bounce_fee's own
+    # bounced_ids_on_lease query to confirm emptiness") -- never re-derived,
+    # so this function's gate can never disagree with post_bounce_fee's
+    # about what counts as "no bounce to pair with." A non-empty result
+    # means there IS an unresolved bounce on this lease -- post_bounce_fee's
+    # own path owns this transaction instead (spec Never: never
+    # double-post).
+    bounced_ids_on_lease = list(
+        LeaseTransactionRef.objects.filter(
+            lease_id=txn.lease_id, status=CHEQUE_STATUS_BOUNCED
+        ).values_list("id", flat=True)
+    )
+    if bounced_ids_on_lease:
+        return {"posted": False, "reason": "unresolved_bounce_exists"}
+
+    transition = OTHER_CHARGE_POSTED_TRANSITION
+
+    if JournalEntry.objects.filter(
+        source_lease_transaction_id=lease_transaction_id,
+        source_status_transition=transition,
+    ).exists():
+        logger.info(
+            "post_other_charge: JournalEntry already exists for "
+            "lease_transaction_id=%s transition=%s -- skipping duplicate "
+            "post",
+            lease_transaction_id,
+            transition,
+        )
+        return {"posted": False, "reason": "duplicate_skip"}
+
+    # Walk the same PMC resolution chain every other posting function
+    # uses -- no new resolution mechanism (spec Code Map).
+    lease = LeaseRef.objects.filter(pk=txn.lease_id).first()
+    if lease is None:
+        logger.error(
+            "post_other_charge: unresolvable PMC for lease_transaction_id="
+            "%s -- no Lease found for lease_id=%s",
+            lease_transaction_id,
+            txn.lease_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    unit = UnitRef.objects.filter(pk=lease.unit_id).first()
+    if unit is None:
+        logger.error(
+            "post_other_charge: unresolvable PMC for lease_transaction_id="
+            "%s -- no Unit found for unit_id=%s",
+            lease_transaction_id,
+            lease.unit_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    property_ = PropertyRef.objects.filter(pk=unit.parent_property_id).first()
+    if property_ is None:
+        logger.error(
+            "post_other_charge: unresolvable PMC for lease_transaction_id="
+            "%s -- no Property found for parent_property_id=%s",
+            lease_transaction_id,
+            unit.parent_property_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    profile = FinancePMCProfile.objects.filter(pmc_id=property_.pmc_id).first()
+    if profile is None:
+        logger.error(
+            "post_other_charge: unresolvable PMC for lease_transaction_id="
+            "%s -- no FinancePMCProfile found for pmc_id=%s",
+            lease_transaction_id,
+            property_.pmc_id,
+        )
+        return {"posted": False, "reason": "unresolvable_pmc"}
+
+    # Resolve the operator-configured (profile, charge_id) mapping -- fail
+    # loudly (no partial post) if missing or inactive (spec Always: "same
+    # 'fail loudly, no silent skip on missing config' precedent as every
+    # other posting function's unresolvable-PMC path").
+    charge_type = PMCChargeType.objects.filter(
+        finance_pmc_profile=profile, charge_id=txn.charge_id
+    ).first()
+    if charge_type is None:
+        logger.error(
+            "post_other_charge: no PMCChargeType configured for "
+            "pmc_id=%s charge_id=%s (lease_transaction_id=%s) -- cannot "
+            "post",
+            profile.pmc_id,
+            txn.charge_id,
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "no_charge_type_configured"}
+
+    if not charge_type.active:
+        logger.error(
+            "post_other_charge: PMCChargeType id=%s for pmc_id=%s "
+            "charge_id=%s is inactive (lease_transaction_id=%s) -- cannot "
+            "post",
+            charge_type.id,
+            profile.pmc_id,
+            txn.charge_id,
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "charge_type_inactive"}
+
+    charge = ChargeRef.objects.filter(pk=txn.charge_id).first()
+    if charge is None:
+        logger.error(
+            "post_other_charge: no Charge found for charge_id=%s "
+            "(lease_transaction_id=%s) -- cannot post",
+            txn.charge_id,
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "charge_not_found"}
+
+    fee_amount = charge.amount
+    if fee_amount is None:
+        logger.error(
+            "post_other_charge: Charge charge_id=%s has no amount "
+            "(lease_transaction_id=%s) -- cannot post",
+            txn.charge_id,
+            lease_transaction_id,
+        )
+        return {"posted": False, "reason": "missing_charge_amount"}
+    vat_amount = charge.vat_amount or 0
+
+    try:
+        ar_account = Account.objects.get(
+            finance_pmc_profile=profile, name=AR_ACCOUNT_NAME_FOR_OTHER_CHARGE
+        )
+        vat_payable_account = None
+        if vat_amount:
+            vat_payable_account = Account.objects.get(
+                finance_pmc_profile=profile,
+                name=VAT_PAYABLE_ACCOUNT_NAME_FOR_OTHER_CHARGE,
+            )
+    except Account.DoesNotExist:
+        logger.error(
+            "post_other_charge: Chart of Accounts not configured for "
+            "FinancePMCProfile pmc_id=%s (lease_transaction_id=%s) -- "
+            "expected Account named %r%s",
+            profile.pmc_id,
+            lease_transaction_id,
+            AR_ACCOUNT_NAME_FOR_OTHER_CHARGE,
+            f" and {VAT_PAYABLE_ACCOUNT_NAME_FOR_OTHER_CHARGE!r}"
+            if vat_amount
+            else "",
+        )
+        return {"posted": False, "reason": "chart_of_accounts_not_configured"}
+
+    ar_debit_total = fee_amount + vat_amount
+
+    # Lines built as decimal-friendly strings, matching post_manual_entry's
+    # own accepted input shape (spec Code Map: reuse Story 5.1's construct-
+    # and-validate path, not a hand-rolled JournalEntry/LedgerLine block).
+    lines = [
+        {"account_id": ar_account.id, "debit": ar_debit_total, "credit": 0},
+        {"account_id": charge_type.account_id, "debit": 0, "credit": fee_amount},
+    ]
+    if vat_amount:
+        lines.append(
+            {"account_id": vat_payable_account.id, "debit": 0, "credit": vat_amount}
+        )
+
+    try:
+        entry = post_manual_entry(
+            profile,
+            lines,
+            memo=f"Other charge (charge_id={txn.charge_id})",
+            source_lease_transaction_id=lease_transaction_id,
+            source_status_transition=transition,
+        )
+    except ManualEntryValidationError as exc:
+        # Should be unreachable given the construction above (accounts are
+        # already resolved and validated, the lines are already balanced),
+        # but never silently swallow a validation failure if it somehow
+        # occurs -- surface it as a logged, non-posted outcome rather than
+        # letting it propagate as a 500 (spec Always: no partial post).
+        logger.error(
+            "post_other_charge: manual-entry validation failed for "
+            "lease_transaction_id=%s -- %s",
+            lease_transaction_id,
+            exc.message,
+        )
+        return {"posted": False, "reason": "manual_entry_validation_failed"}
+
+    logger.info(
+        "post_other_charge: posted JournalEntry id=%s for "
+        "lease_transaction_id=%s (pmc_id=%s, charge_id=%s, "
+        "pmc_charge_type_id=%s, fee_amount=%s, vat_amount=%s)",
+        entry.id,
+        lease_transaction_id,
+        profile.pmc_id,
+        txn.charge_id,
+        charge_type.id,
+        fee_amount,
         vat_amount,
     )
     return {"posted": True, "reason": ""}

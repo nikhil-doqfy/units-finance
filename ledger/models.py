@@ -66,6 +66,34 @@ class Account(models.Model):
         (EQUITY, "Equity"),
     ]
 
+    # Story 5.3 (FR-18): sub-categories under the five flat account_type
+    # values, so Balance Sheet/CoA views can group accounts the way an
+    # accountant expects. Deliberately not cross-field-validated against
+    # account_type at the DB level (spec Boundaries & Constraints) -- a
+    # Phase-1 fixed seed with no CoA editor makes that disproportionate.
+    FIXED_ASSET = "FIXED_ASSET"
+    CURRENT_ASSET = "CURRENT_ASSET"
+    OTHER_CURRENT_ASSET = "OTHER_CURRENT_ASSET"
+    # Named LIABILITY_SUBTYPE (post-review clarification), NOT the same
+    # Python attribute as the parent `Account.LIABILITY` account_type above
+    # -- deliberately the same stored string value, though, per the epic's
+    # own AC ("LIABILITY (unchanged split retained)"): Phase 1 keeps a
+    # single Liability subtype rather than splitting current/long-term
+    # liabilities. Always reference this constant, never the raw string
+    # "LIABILITY", so a future split stays a one-place rename.
+    LIABILITY_SUBTYPE = "LIABILITY"
+    CAPITAL_CONTRIBUTION = "CAPITAL_CONTRIBUTION"
+    SHARE_CAPITAL = "SHARE_CAPITAL"
+
+    ACCOUNT_SUBTYPE_CHOICES = [
+        (FIXED_ASSET, "Fixed Asset"),
+        (CURRENT_ASSET, "Current Asset"),
+        (OTHER_CURRENT_ASSET, "Other Current Asset"),
+        (LIABILITY_SUBTYPE, "Liability"),
+        (CAPITAL_CONTRIBUTION, "Capital Contribution"),
+        (SHARE_CAPITAL, "Share Capital"),
+    ]
+
     finance_pmc_profile = models.ForeignKey(
         FinancePMCProfile,
         on_delete=models.CASCADE,
@@ -73,9 +101,81 @@ class Account(models.Model):
     )
     name = models.CharField(max_length=255)
     account_type = models.CharField(max_length=20, choices=ACCOUNT_TYPE_CHOICES)
+    account_subtype = models.CharField(
+        max_length=25,
+        choices=ACCOUNT_SUBTYPE_CHOICES,
+        null=True,
+        blank=True,
+        help_text="Sub-category under account_type (Story 5.3/FR-18) -- "
+        "nullable so a migration adding this field never breaks existing "
+        "rows (spec Always). None for Income/Expense accounts, which have "
+        "no subtype in Phase 1.",
+    )
 
     def __str__(self):
         return f"Account(name={self.name}, type={self.account_type}, pmc_profile_id={self.finance_pmc_profile_id})"
+
+
+class PMCChargeType(models.Model):
+    """Story 5.2 (FR-17): maps an existing units-backend `Charge` catalog
+    row to a Finance `Account`, one row per `(finance_pmc_profile,
+    charge_id)` pair.
+
+    Finance-owned -- never a modification to units-backend's `charges` app
+    or `Charge` model (spec Always); Finance only ever reads `Charge` via
+    the existing unmanaged `ChargeRef` (AD-5 precedent). `charge_id` is
+    deliberately a plain `BigIntegerField`, not a Django FK, mirroring every
+    other cross-service reference in this codebase (AD-19 precedent) -- it
+    references units-backend's `Charge.id`, which lives in a different
+    Django project's migration set despite sharing the same Postgres
+    instance.
+
+    `account` IS a real Django `ForeignKey` -- both `PMCChargeType` and
+    `Account` are Finance-owned models living in this same app/database
+    (spec Always).
+
+    An inactive row (`active=False`) never produces a new posting, but
+    existing postings from when it was active remain untouched -- no
+    retroactive reversal (spec Never).
+    """
+
+    finance_pmc_profile = models.ForeignKey(
+        FinancePMCProfile,
+        on_delete=models.CASCADE,
+        related_name="pmc_charge_types",
+    )
+    charge_id = models.BigIntegerField(
+        help_text="units-backend Charge.id — not a cross-DB FK (AD-19 precedent)."
+    )
+    account = models.ForeignKey(
+        Account,
+        on_delete=models.CASCADE,
+        related_name="pmc_charge_types",
+    )
+    active = models.BooleanField(default=True)
+    created = models.DateTimeField(auto_now_add=True)
+    modified = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        # Post-review addition: the ORM's `.filter(...).first()` lookups in
+        # `post_other_charge`/`pmc_charge_types` assume exactly one row per
+        # pair -- without this, a concurrent-POST race (or a direct
+        # `.create()` bypassing the endpoint's `update_or_create`) could
+        # produce a duplicate, and `.first()` would silently pick an
+        # arbitrary one instead of erroring.
+        constraints = [
+            models.UniqueConstraint(
+                fields=["finance_pmc_profile", "charge_id"],
+                name="unique_pmc_charge_type_per_profile_and_charge",
+            )
+        ]
+
+    def __str__(self):
+        return (
+            f"PMCChargeType(finance_pmc_profile_id={self.finance_pmc_profile_id}, "
+            f"charge_id={self.charge_id}, account_id={self.account_id}, "
+            f"active={self.active})"
+        )
 
 
 class PropertyManagmentCompanyRef(models.Model):
@@ -112,7 +212,25 @@ class JournalEntry(models.Model):
     precedent — it references units-backend's `LeaseTransaction` row, which
     lives in a different Django project's migration set despite sharing the
     same Postgres instance (AD-2).
+
+    Story 5.1 (FR-16) makes `source_lease_transaction_id` nullable and adds
+    `source_type`, so a manual, free-form entry (no originating
+    `LeaseTransaction`) can coexist with posting-engine entries: a manual
+    entry always has `source_type=MANUAL` and
+    `source_lease_transaction_id=None`, and that field's presence always
+    implies `source_type=LEASE_TRANSACTION` (spec Never — mutual exclusivity
+    enforced at the model/serializer level, not just convention).
+    `source_type` defaults to `LEASE_TRANSACTION` so every existing row
+    backfills correctly without a data migration (spec Code Map).
     """
+
+    LEASE_TRANSACTION = "LEASE_TRANSACTION"
+    MANUAL = "MANUAL"
+
+    SOURCE_TYPE_CHOICES = [
+        (LEASE_TRANSACTION, "Lease Transaction"),
+        (MANUAL, "Manual"),
+    ]
 
     finance_pmc_profile = models.ForeignKey(
         FinancePMCProfile,
@@ -120,12 +238,34 @@ class JournalEntry(models.Model):
         related_name="journal_entries",
     )
     source_lease_transaction_id = models.BigIntegerField(
-        help_text="units-backend LeaseTransaction.id — not a cross-DB FK (AD-19 precedent)."
+        null=True,
+        blank=True,
+        help_text="units-backend LeaseTransaction.id — not a cross-DB FK "
+        "(AD-19 precedent). Null for source_type=MANUAL entries (FR-16).",
+    )
+    source_type = models.CharField(
+        max_length=20,
+        choices=SOURCE_TYPE_CHOICES,
+        default=LEASE_TRANSACTION,
+        help_text="Discriminates posting-engine entries (LEASE_TRANSACTION, "
+        "the default) from operator-entered ones (MANUAL, Story 5.1/FR-16).",
     )
     source_status_transition = models.CharField(
         max_length=100,
+        blank=True,
+        default="",
         help_text="Exact FROM_STATUS->TO_STATUS pair; idempotency key with "
-        "source_lease_transaction_id (AD-14).",
+        "source_lease_transaction_id (AD-14). Not applicable to manual "
+        "entries (source_type=MANUAL) -- left blank, never fabricated "
+        "(spec Always).",
+    )
+    memo = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Optional operator-entered note for a manual entry "
+        "(source_type=MANUAL, Story 5.1/FR-16). Always blank for "
+        "posting-engine entries -- no story populates it for those.",
     )
     reversed_journal_entry = models.ForeignKey(
         "self",

@@ -35,13 +35,16 @@ from ledger.models import (
     FinancePMCProfile,
     JournalEntry,
     LedgerLine,
+    PMCChargeType,
 )
 from ledger.org_scope import get_pmc_ids_for_user_profile
+from ledger.reports import compute_chart_of_accounts
 from ledger.posting import (
     post_bounce_fee,
     post_bounce_reversal,
     post_cheque_clearing,
     post_commission_split,
+    post_other_charge,
     post_rent_ar,
     post_security_deposit,
 )
@@ -194,27 +197,48 @@ class SeedStandardChartOfAccountsTests(TestCase):
         accounts = Account.objects.filter(finance_pmc_profile=profile)
         self.assertEqual(accounts.count(), len(STANDARD_CHART_OF_ACCOUNTS))
 
-        actual_pairs = {(a.name, a.account_type) for a in accounts}
-        expected_pairs = set(STANDARD_CHART_OF_ACCOUNTS)
-        self.assertEqual(actual_pairs, expected_pairs)
+        actual_triples = {(a.name, a.account_type, a.account_subtype) for a in accounts}
+        expected_triples = set(STANDARD_CHART_OF_ACCOUNTS)
+        self.assertEqual(actual_triples, expected_triples)
 
         # Independent of STANDARD_CHART_OF_ACCOUNTS — asserts the literal FR-3
-        # + Story 2.4 account list so a typo/misclassification introduced in
-        # seed.py itself would fail this test, not just self-agree with it.
+        # + Story 2.4 + Story 5.3 (FR-18) account list so a typo/
+        # misclassification introduced in seed.py itself would fail this
+        # test, not just self-agree with it.
         self.assertEqual(
-            actual_pairs,
+            actual_triples,
             {
-                ("Rent Income", Account.INCOME),
-                ("Security Deposits Held", Account.LIABILITY),
-                ("VAT Payable", Account.LIABILITY),
-                ("Bank", Account.ASSET),
-                ("AR — Tenants", Account.ASSET),
-                ("AP — PMC Commission", Account.LIABILITY),
-                ("Commission Expense", Account.EXPENSE),
-                ("Bank Charges/Fees", Account.EXPENSE),
-                ("Bounced Cheques", Account.ASSET),
+                ("Rent Income", Account.INCOME, None),
+                ("Security Deposits Held", Account.LIABILITY, Account.LIABILITY_SUBTYPE),
+                ("VAT Payable", Account.LIABILITY, Account.LIABILITY_SUBTYPE),
+                ("Bank", Account.ASSET, Account.CURRENT_ASSET),
+                ("AR — Tenants", Account.ASSET, Account.CURRENT_ASSET),
+                ("AP — PMC Commission", Account.LIABILITY, Account.LIABILITY_SUBTYPE),
+                ("Commission Expense", Account.EXPENSE, None),
+                ("Bank Charges/Fees", Account.EXPENSE, None),
+                ("Bounced Cheques", Account.ASSET, Account.CURRENT_ASSET),
             },
         )
+
+    def test_no_seeded_account_left_uncategorized_except_income_expense(self):
+        """Story 5.3 (FR-18) I/O matrix row 1: every one of the 9 standard
+        accounts has an explicit account_subtype, except Income/Expense
+        accounts (which have nothing to subtype into in Phase 1)."""
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=1,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+        for account in Account.objects.filter(finance_pmc_profile=profile):
+            if account.account_type in (Account.INCOME, Account.EXPENSE):
+                self.assertIsNone(account.account_subtype)
+            else:
+                self.assertIsNotNone(
+                    account.account_subtype,
+                    f"{account.name} ({account.account_type}) was left uncategorized",
+                )
 
     def test_seed_helper_called_twice_directly_creates_duplicates(self):
         """Documents the seed helper's actual (non-)idempotency contract.
@@ -294,6 +318,78 @@ class SeedStandardChartOfAccountsTests(TestCase):
             Account.objects.filter(finance_pmc_profile=profile).count(),
             len(STANDARD_CHART_OF_ACCOUNTS),
         )
+
+
+class AccountSubtypeTests(TestCase):
+    """Story 5.3 (FR-18) tests: `account_subtype` field, seed backfill, and
+    Chart of Accounts view surfacing.
+
+    Covers all three I/O matrix rows from the spec:
+      1. New PMC seeded after this story ships -- all 9 accounts have both
+         account_type and account_subtype set (correct value, or None for
+         Income/Expense) -- see test_no_seeded_account_left_uncategorized_
+         except_income_expense above for the full backfill assertion.
+      2. Existing PMC, seeded before this story -- account_subtype is null
+         immediately after the migration, no data migration touches
+         existing rows.
+      3. Chart of Accounts view (compute_chart_of_accounts) -- response
+         includes account_subtype per row (null for pre-existing
+         unbackfilled rows, a real value for newly-seeded ones).
+    """
+
+    def test_existing_preseeded_rows_stay_null_after_field_added(self):
+        """Simulates a pre-Story-5.3 Account row (created without ever
+        setting account_subtype, as if seeded before this migration) --
+        confirms it is simply null, never guessed/backfilled (spec
+        Boundaries & Constraints/Design Notes: no best-effort name-matching
+        backfill migration)."""
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=1,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+        # Bypass the seed helper entirely to model a genuinely pre-existing
+        # row that predates the account_subtype field/backfill.
+        pre_existing = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Bank",
+            account_type=Account.ASSET,
+        )
+
+        pre_existing.refresh_from_db()
+        self.assertIsNone(pre_existing.account_subtype)
+
+    def test_chart_of_accounts_report_includes_account_subtype(self):
+        """New-PMC CoA rows surface their real subtype; a null-subtype row
+        (modeling a pre-existing, unbackfilled account) surfaces as None --
+        never a fabricated guess."""
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=1,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+        # Add a stand-in "pre-existing, unbackfilled" row alongside the
+        # newly-seeded ones.
+        Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Legacy Suspense",
+            account_type=Account.ASSET,
+        )
+
+        result = compute_chart_of_accounts(profile)
+        by_name = {row["name"]: row["account_subtype"] for row in result["accounts"]}
+
+        self.assertEqual(by_name["Bank"], Account.CURRENT_ASSET)
+        self.assertEqual(by_name["AR — Tenants"], Account.CURRENT_ASSET)
+        self.assertEqual(by_name["Security Deposits Held"], Account.LIABILITY_SUBTYPE)
+        self.assertEqual(by_name["VAT Payable"], Account.LIABILITY_SUBTYPE)
+        self.assertEqual(by_name["AP — PMC Commission"], Account.LIABILITY_SUBTYPE)
+        self.assertIsNone(by_name["Rent Income"])
+        self.assertIsNone(by_name["Commission Expense"])
+        self.assertIsNone(by_name["Bank Charges/Fees"])
+        self.assertIsNone(by_name["Legacy Suspense"])
 
 
 @override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token")
@@ -652,19 +748,22 @@ class PostRentArTests(TestCase):
         self.assertEqual(entry.finance_pmc_profile_id, profile.id)
 
         lines = LedgerLine.objects.filter(journal_entry=entry)
-        self.assertEqual(lines.count(), 2)
+        self.assertEqual(lines.count(), 3)
 
         ar_line = lines.get(account__name="AR — Tenants")
         income_line = lines.get(account__name="Rent Income")
-        self.assertEqual(ar_line.debit, 5000)
+        vat_line = lines.get(account__name="VAT Payable")
+        self.assertEqual(ar_line.debit, 5250)
         self.assertEqual(ar_line.credit, 0)
         self.assertEqual(income_line.debit, 0)
         self.assertEqual(income_line.credit, 5000)
+        self.assertEqual(vat_line.debit, 0)
+        self.assertEqual(vat_line.credit, 250)
 
         debit_total = sum(line.debit for line in lines)
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
-        self.assertEqual(debit_total, 5000)
+        self.assertEqual(debit_total, 5250)
 
     def test_duplicate_sync_is_skipped(self):
         self._make_profile(pmc_id=1)
@@ -806,6 +905,82 @@ class PostRentArTests(TestCase):
         self.assertEqual(
             JournalEntry.objects.filter(source_lease_transaction_id=106).count(), 0
         )
+
+    def test_vat_standard_case_1000_amount(self):
+        """Story 5.5 I/O matrix: amount=1000 -> AR debit 1050, Rent Income
+        credit 1000, VAT Payable credit 50."""
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=107,
+                lease_id=17,
+                unit_id=27,
+                property_id=37,
+                pmc_id=1,
+                amount=1000,
+            )
+
+        result = post_rent_ar(107)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=107,
+            source_status_transition="CREATE-BALANCE",
+        )
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 3)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        income_line = lines.get(account__name="Rent Income")
+        vat_line = lines.get(account__name="VAT Payable")
+        self.assertEqual(ar_line.debit, 1050)
+        self.assertEqual(income_line.credit, 1000)
+        self.assertEqual(vat_line.credit, 50)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 1050)
+
+    def test_vat_rounding_edge_case_33_33_amount(self):
+        """Story 5.5 I/O matrix rounding edge: amount=33.33 -> VAT =
+        1.6665 rounds to 1.67; AR debit = 34.9965 rounds to 35.00; entry
+        still balances (AR = Rent Income + VAT Payable exactly, both
+        rounded consistently)."""
+        self._make_profile(pmc_id=1)
+        with connection.cursor() as cursor:
+            self._insert_chain(
+                cursor,
+                txn_id=108,
+                lease_id=18,
+                unit_id=28,
+                property_id=38,
+                pmc_id=1,
+                amount=33.33,
+            )
+
+        result = post_rent_ar(108)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=108,
+            source_status_transition="CREATE-BALANCE",
+        )
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 3)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        income_line = lines.get(account__name="Rent Income")
+        vat_line = lines.get(account__name="VAT Payable")
+        self.assertEqual(vat_line.credit, decimal.Decimal("1.67"))
+        self.assertEqual(ar_line.debit, decimal.Decimal("35.00"))
+        self.assertEqual(income_line.credit, decimal.Decimal("33.33"))
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, decimal.Decimal("35.00"))
 
 
 class PostChequeClearingTests(TestCase):
@@ -977,21 +1152,31 @@ class PostChequeClearingTests(TestCase):
 
         bank_line = lines.get(account__name="Bank")
         ar_line = lines.get(account__name="AR — Tenants")
-        self.assertEqual(bank_line.debit, 5000)
+        self.assertEqual(bank_line.debit, 5250)
         self.assertEqual(bank_line.credit, 0)
         self.assertEqual(ar_line.debit, 0)
-        self.assertEqual(ar_line.credit, 5000)
+        self.assertEqual(ar_line.credit, 5250)
 
         debit_total = sum(line.debit for line in lines)
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
-        self.assertEqual(debit_total, 5000)
+        self.assertEqual(debit_total, 5250)
 
         # Exactly two JournalEntries total for this lease_transaction_id --
         # the original Rent AR posting plus this clearing posting.
         self.assertEqual(
             JournalEntry.objects.filter(source_lease_transaction_id=200).count(), 2
         )
+
+        # Story 5.5: AR nets to exactly zero across the post -> clear
+        # lifecycle -- the VAT-inclusive debit from post_rent_ar and the
+        # VAT-inclusive credit from post_cheque_clearing cancel out.
+        ar_lines_for_txn = LedgerLine.objects.filter(
+            journal_entry__source_lease_transaction_id=200,
+            account__name="AR — Tenants",
+        )
+        net_ar = sum(line.debit - line.credit for line in ar_lines_for_txn)
+        self.assertEqual(net_ar, 0)
 
     def test_two_step_clearing_posts_two_separate_journal_entries(self):
         self._make_profile(pmc_id=1)
@@ -1307,11 +1492,11 @@ class SyncLeaseTransactionRentPostingIntegrationTests(TestCase):
         )
         self.assertEqual(entry.finance_pmc_profile_id, profile.id)
         lines = LedgerLine.objects.filter(journal_entry=entry)
-        self.assertEqual(lines.count(), 2)
+        self.assertEqual(lines.count(), 3)
         debit_total = sum(line.debit for line in lines)
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
-        self.assertEqual(debit_total, 7500)
+        self.assertEqual(debit_total, 7875)
 
 
 class PostBounceReversalTests(TestCase):
@@ -1495,20 +1680,30 @@ class PostBounceReversalTests(TestCase):
         ar_line = lines.get(account__name="AR — Tenants")
         bounced_line = lines.get(account__name="Bounced Cheques")
         self.assertEqual(ar_line.debit, 0)
-        self.assertEqual(ar_line.credit, 5000)
-        self.assertEqual(bounced_line.debit, 5000)
+        self.assertEqual(ar_line.credit, 5250)
+        self.assertEqual(bounced_line.debit, 5250)
         self.assertEqual(bounced_line.credit, 0)
 
         debit_total = sum(line.debit for line in lines)
         credit_total = sum(line.credit for line in lines)
         self.assertEqual(debit_total, credit_total)
-        self.assertEqual(debit_total, 5000)
+        self.assertEqual(debit_total, 5250)
 
         # Exactly two JournalEntries total for this lease_transaction_id --
         # the original Rent AR posting plus this reversal.
         self.assertEqual(
             JournalEntry.objects.filter(source_lease_transaction_id=300).count(), 2
         )
+
+        # Story 5.5: AR nets to exactly zero across the post -> bounce
+        # lifecycle -- the VAT-inclusive debit from post_rent_ar and the
+        # VAT-inclusive credit from post_bounce_reversal cancel out.
+        ar_lines_for_txn = LedgerLine.objects.filter(
+            journal_entry__source_lease_transaction_id=300,
+            account__name="AR — Tenants",
+        )
+        net_ar = sum(line.debit - line.credit for line in ar_lines_for_txn)
+        self.assertEqual(net_ar, 0)
 
     def test_duplicate_sync_is_skipped(self):
         self._make_profile(pmc_id=1)
@@ -1617,12 +1812,12 @@ class PostBounceReversalTests(TestCase):
             sum(line.debit for line in lines_303),
             sum(line.credit for line in lines_303),
         )
-        self.assertEqual(sum(line.debit for line in lines_303), 2000)
+        self.assertEqual(sum(line.debit for line in lines_303), 2100)
         self.assertEqual(
             sum(line.debit for line in lines_304),
             sum(line.credit for line in lines_304),
         )
-        self.assertEqual(sum(line.debit for line in lines_304), 6000)
+        self.assertEqual(sum(line.debit for line in lines_304), 6300)
 
         # No shared idempotency state -- each id has exactly its own two
         # entries (CREATE-BALANCE + BALANCE-BOUNCED).
@@ -3441,10 +3636,6 @@ class PostCommissionSplitTests(TestCase):
 
     def test_unconfigured_chart_of_accounts_posts_nothing(self):
         profile = self._make_profile(pmc_id=1)
-        Account.objects.filter(
-            finance_pmc_profile=profile,
-            name__in=["Commission Expense", "AP — PMC Commission", "VAT Payable"],
-        ).delete()
         with connection.cursor() as cursor:
             self._insert_chain(
                 cursor,
@@ -3457,7 +3648,16 @@ class PostCommissionSplitTests(TestCase):
                 commission_percent=8,
             )
 
+        # post_rent_ar must succeed first (Story 5.5: it now also needs a
+        # VAT Payable Account for its own 3-line entry) -- only AFTER that
+        # succeeds do we delete the Accounts this test is actually about,
+        # isolating post_commission_split's own chart_of_accounts_not_configured
+        # path from post_rent_ar's.
         self.assertTrue(post_rent_ar(409)["posted"])
+        Account.objects.filter(
+            finance_pmc_profile=profile,
+            name__in=["Commission Expense", "AP — PMC Commission", "VAT Payable"],
+        ).delete()
         result = post_commission_split(409)
 
         self.assertFalse(result["posted"])
@@ -7321,3 +7521,1746 @@ class BankStatementMatchTests(TestCase):
         self.assertEqual(response.status_code, 200)
         line.refresh_from_db()
         self.assertTrue(line.reconciled)
+
+
+class ManualJournalEntryEndpointTests(TrialBalanceReportTests):
+    """Story 5.1 tests: POST/GET /ledger/manual-entries (FR-16).
+
+    Subclasses `TrialBalanceReportTests` to reuse its stand-in-table
+    setUpClass/tearDownClass/setUp and its `_make_profile`/
+    `_make_owner_with_pmc`/`_make_token` helpers -- this endpoint follows
+    the same auth/validate/resolve/scope sequence as Trial Balance (spec
+    Code Map), so the same fixtures apply unchanged.
+
+    Covers every row of the spec's I/O & Edge-Case Matrix:
+      1. Balanced entry -- 201, JournalEntry(source_type=MANUAL,
+         source_lease_transaction_id=None) + LedgerLines created.
+      2. Unbalanced entry -- 400, no rows created.
+      3. Fewer than two lines -- 400, no rows created.
+      4. Account from a different PMC -- 400, no rows created.
+      5. Missing/invalid pmc_id -- 400.
+      6. No FinancePMCProfile for pmc_id -- 404.
+      7. Caller not authorized for the PMC -- 403.
+
+    Plus: a manual entry's debit/credit is included in Trial Balance
+    identically to a posting-engine entry (spec Always -- no report
+    special-cases source_type), and `memo` round-trips end to end (the
+    field this story's first implementation pass silently dropped).
+    """
+
+    def _url(self):
+        return reverse("create-manual-journal-entry")
+
+    def _get_url(self):
+        return reverse("create-manual-journal-entry")
+
+    # Inherited from TrialBalanceReportTests but not applicable here: this
+    # endpoint is POST-based with a different request/response shape
+    # (manual-entry lines, not a report). Skipped rather than deleted, to
+    # keep the inheritance-for-fixture-reuse pattern's intent explicit
+    # (matches ProfitLossReportTests' precedent above).
+    def test_happy_path_returns_every_account_balanced_true(self):
+        self.skipTest("superseded by manual-entry-shaped happy-path test below")
+
+    def test_zero_activity_account_included_with_zero_totals(self):
+        self.skipTest("not applicable -- no report/zero-activity concept here")
+
+    def test_reversal_entry_summed_unconditionally(self):
+        self.skipTest("not applicable -- this endpoint does not post reversals")
+
+    def test_unreachable_pmc_id_rejected_with_403(self):
+        self.skipTest("superseded by test_unauthorized_pmc_rejected_with_403 below")
+
+    def test_missing_date_range_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_invalid_date_format_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_inverted_date_range_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_unauthenticated_request_rejected_with_401_before_any_query(self):
+        self.skipTest(
+            "superseded by test_unauthenticated_request_rejected_with_401 below"
+        )
+
+    def test_expired_token_rejected_with_401(self):
+        self.skipTest(
+            "covered by test_unauthenticated_request_rejected_with_401 below "
+            "via the same auth helper Trial Balance itself uses -- no "
+            "manual-entries-specific expiry behavior to re-verify"
+        )
+
+    def test_balanced_entry_creates_manual_journal_entry(self):
+        profile = self._make_profile(pmc_id=30)
+        token = self._make_token("owner30@example.com")
+        self._make_owner_with_pmc(
+            30, "owner30@example.com", token, 230, unit_id=40, property_id=50, pmc_id=30
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 30,
+                "memo": "Petty cash correction",
+                "lines": [
+                    {"account_id": bank.id, "debit": "150.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "150.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["content"]["source_type"], "MANUAL")
+        self.assertEqual(body["content"]["memo"], "Petty cash correction")
+
+        entry = JournalEntry.objects.get(pk=body["content"]["journal_entry_id"])
+        self.assertEqual(entry.source_type, JournalEntry.MANUAL)
+        self.assertIsNone(entry.source_lease_transaction_id)
+        self.assertEqual(entry.memo, "Petty cash correction")
+        self.assertEqual(entry.lines.count(), 2)
+
+    def test_unbalanced_entry_rejected_with_400_no_rows_created(self):
+        profile = self._make_profile(pmc_id=31)
+        token = self._make_token("owner31@example.com")
+        self._make_owner_with_pmc(
+            31, "owner31@example.com", token, 231, unit_id=41, property_id=51, pmc_id=31
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 31,
+                "lines": [
+                    {"account_id": bank.id, "debit": "150.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "100.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_fewer_than_two_lines_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=32)
+        token = self._make_token("owner32@example.com")
+        self._make_owner_with_pmc(
+            32, "owner32@example.com", token, 232, unit_id=42, property_id=52, pmc_id=32
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 32,
+                "lines": [{"account_id": bank.id, "debit": "50.00", "credit": "0.00"}],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_account_from_different_pmc_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=33)
+        other_profile = self._make_profile(pmc_id=34)
+        token = self._make_token("owner33@example.com")
+        self._make_owner_with_pmc(
+            33, "owner33@example.com", token, 233, unit_id=43, property_id=53, pmc_id=33
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        other_rent_income = Account.objects.get(
+            finance_pmc_profile=other_profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 33,
+                "lines": [
+                    {"account_id": bank.id, "debit": "50.00", "credit": "0.00"},
+                    {
+                        "account_id": other_rent_income.id,
+                        "debit": "0.00",
+                        "credit": "50.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=other_profile).count(), 0
+        )
+
+    def test_missing_pmc_id_rejected_with_400(self):
+        token = self._make_token("owner35@example.com")
+        self._make_owner_with_pmc(
+            35, "owner35@example.com", token, 235, unit_id=49, property_id=59, pmc_id=35
+        )
+
+        response = self.client.post(
+            self._url(),
+            {"lines": [{"account_id": 1, "debit": "10.00", "credit": "0.00"}]},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_nonexistent_pmc_id_rejected_with_404(self):
+        token = self._make_token("owner36@example.com")
+        self._make_owner_with_pmc(
+            36, "owner36@example.com", token, 236, unit_id=44, property_id=54, pmc_id=999
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 999,
+                "lines": [
+                    {"account_id": 1, "debit": "10.00", "credit": "0.00"},
+                    {"account_id": 2, "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_unauthorized_pmc_rejected_with_403(self):
+        self._make_profile(pmc_id=37)
+        token = self._make_token("owner37@example.com")
+        # Owner is scoped to pmc_id=38, not pmc_id=37.
+        self._make_owner_with_pmc(
+            37, "owner37@example.com", token, 237, unit_id=45, property_id=55, pmc_id=38
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 37,
+                "lines": [
+                    {"account_id": 1, "debit": "10.00", "credit": "0.00"},
+                    {"account_id": 2, "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_unauthenticated_request_rejected_with_401(self):
+        self._make_profile(pmc_id=39)
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 39,
+                "lines": [
+                    {"account_id": 1, "debit": "10.00", "credit": "0.00"},
+                    {"account_id": 2, "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_manual_entry_included_in_trial_balance_like_posting_engine_entry(self):
+        """spec Always: 'no report special-cases source_type'."""
+        profile = self._make_profile(pmc_id=40)
+        token = self._make_token("owner40@example.com")
+        self._make_owner_with_pmc(
+            40, "owner40@example.com", token, 240, unit_id=46, property_id=56, pmc_id=40
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        create_response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 40,
+                "lines": [
+                    {"account_id": bank.id, "debit": "300.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "300.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(create_response.status_code, 201)
+
+        entry = JournalEntry.objects.get(
+            pk=create_response.json()["content"]["journal_entry_id"]
+        )
+        entry_date = entry.posted_at.date().isoformat()
+
+        trial_balance_response = self.client.get(
+            reverse("trial-balance-report"),
+            {"pmc_id": 40, "start_date": entry_date, "end_date": entry_date},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(trial_balance_response.status_code, 200)
+        accounts = {
+            a["name"]: a
+            for a in trial_balance_response.json()["content"]["accounts"]
+        }
+        self.assertEqual(accounts["Bank"]["total_debit"], 300.0)
+        self.assertEqual(accounts["Rent Income"]["total_credit"], 300.0)
+
+    def test_manual_entry_included_in_profit_loss_like_posting_engine_entry(self):
+        """Post-review addition (verification-gap finding): only Trial
+        Balance was previously checked -- P&L reuses compute_trial_balance
+        internally, but nothing asserted a MANUAL entry actually surfaces
+        there too."""
+        profile = self._make_profile(pmc_id=43)
+        token = self._make_token("owner43@example.com")
+        self._make_owner_with_pmc(
+            43, "owner43@example.com", token, 243, unit_id=50, property_id=60, pmc_id=43
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        create_response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 43,
+                "lines": [
+                    {"account_id": bank.id, "debit": "500.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "500.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(create_response.status_code, 201)
+
+        entry = JournalEntry.objects.get(
+            pk=create_response.json()["content"]["journal_entry_id"]
+        )
+        entry_date = entry.posted_at.date().isoformat()
+
+        pl_response = self.client.get(
+            reverse("profit-loss-report"),
+            {"pmc_id": 43, "start_date": entry_date, "end_date": entry_date},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(pl_response.status_code, 200)
+        income_accounts = {
+            a["name"]: a for a in pl_response.json()["content"]["income_accounts"]
+        }
+        self.assertEqual(income_accounts["Rent Income"]["total_credit"], 500.0)
+        self.assertEqual(pl_response.json()["content"]["net_profit_loss"], 500.0)
+
+    def test_manual_entry_included_in_balance_sheet_like_posting_engine_entry(self):
+        """Post-review addition (verification-gap finding): same gap as
+        P&L -- Balance Sheet reuses compute_trial_balance internally but
+        was never checked to actually include a MANUAL entry."""
+        import datetime as dt
+
+        profile = self._make_profile(pmc_id=44)
+        FinancePMCProfile.objects.filter(pk=profile.pk).update(
+            created=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        )
+        profile.refresh_from_db()
+        token = self._make_token("owner44@example.com")
+        self._make_owner_with_pmc(
+            44, "owner44@example.com", token, 244, unit_id=51, property_id=61, pmc_id=44
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        create_response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 44,
+                "lines": [
+                    {"account_id": bank.id, "debit": "200.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "200.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+        self.assertEqual(create_response.status_code, 201)
+
+        bs_response = self.client.get(
+            reverse("balance-sheet-report"),
+            {"pmc_id": 44, "as_of_date": "2026-12-31"},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(bs_response.status_code, 200)
+        content = bs_response.json()["content"]
+        bank_row = next(a for a in content["asset_accounts"] if a["name"] == "Bank")
+        self.assertEqual(bank_row["balance"], 200.0)
+        self.assertTrue(content["balanced"])
+
+    def test_negative_debit_rejected_with_400_no_rows_created(self):
+        profile = self._make_profile(pmc_id=45)
+        token = self._make_token("owner45@example.com")
+        self._make_owner_with_pmc(
+            45, "owner45@example.com", token, 245, unit_id=52, property_id=62, pmc_id=45
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 45,
+                "lines": [
+                    {"account_id": bank.id, "debit": "-50.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "-50.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_line_with_both_debit_and_credit_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=46)
+        token = self._make_token("owner46@example.com")
+        self._make_owner_with_pmc(
+            46, "owner46@example.com", token, 246, unit_id=53, property_id=63, pmc_id=46
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 46,
+                "lines": [
+                    {"account_id": bank.id, "debit": "50.00", "credit": "50.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "50.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_all_zero_value_entry_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=47)
+        token = self._make_token("owner47@example.com")
+        self._make_owner_with_pmc(
+            47, "owner47@example.com", token, 247, unit_id=54, property_id=64, pmc_id=47
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 47,
+                "lines": [
+                    {"account_id": bank.id, "debit": "0.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "0.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_non_dict_line_item_rejected_with_400_not_500(self):
+        profile = self._make_profile(pmc_id=48)
+        token = self._make_token("owner48@example.com")
+        self._make_owner_with_pmc(
+            48, "owner48@example.com", token, 248, unit_id=55, property_id=65, pmc_id=48
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 48,
+                "lines": ["not-a-dict", "also-not-a-dict"],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_non_integer_account_id_rejected_with_400_not_500(self):
+        profile = self._make_profile(pmc_id=49)
+        token = self._make_token("owner49@example.com")
+        self._make_owner_with_pmc(
+            49, "owner49@example.com", token, 249, unit_id=56, property_id=66, pmc_id=49
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 49,
+                "lines": [
+                    {"account_id": "not-an-int", "debit": "10.00", "credit": "0.00"},
+                    {"account_id": "also-not-an-int", "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            JournalEntry.objects.filter(finance_pmc_profile=profile).count(), 0
+        )
+
+    def test_list_endpoint_returns_created_manual_entry_with_memo(self):
+        profile = self._make_profile(pmc_id=41)
+        token = self._make_token("owner41@example.com")
+        self._make_owner_with_pmc(
+            41, "owner41@example.com", token, 241, unit_id=47, property_id=57, pmc_id=41
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        self.client.post(
+            self._url(),
+            {
+                "pmc_id": 41,
+                "memo": "Owner deposit",
+                "lines": [
+                    {"account_id": bank.id, "debit": "75.00", "credit": "0.00"},
+                    {
+                        "account_id": rent_income.id,
+                        "debit": "0.00",
+                        "credit": "75.00",
+                    },
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        list_response = self.client.get(
+            self._get_url(),
+            {"pmc_id": 41},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        entries = list_response.json()["content"]["entries"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["memo"], "Owner deposit")
+
+    def test_no_trailing_slash_url_also_works(self):
+        profile = self._make_profile(pmc_id=42)
+        token = self._make_token("owner42@example.com")
+        self._make_owner_with_pmc(
+            42, "owner42@example.com", token, 242, unit_id=48, property_id=58, pmc_id=42
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+
+        response = self.client.post(
+            reverse("create-manual-journal-entry-no-slash"),
+            {
+                "pmc_id": 42,
+                "lines": [
+                    {"account_id": bank.id, "debit": "10.00", "credit": "0.00"},
+                    {"account_id": rent_income.id, "debit": "0.00", "credit": "10.00"},
+                ],
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+
+class PostOtherChargeTests(TestCase):
+    """Story 5.2 tests: post_other_charge posting logic (FR-17).
+
+    Reuses PostBounceFeeTests' hand-rolled stand-in-table technique
+    (lease_leasetransaction/lease_lease/property_unit/property_property/
+    charges_charge) -- this story's gate/resolution chain is identical.
+
+    Covers every row of the spec's I/O & Edge-Case Matrix:
+      1. OTHER_CHARGE, no unresolved bounce, active PMCChargeType --
+         balanced JournalEntry posts (with a VAT line when vat_amount != 0).
+      2. No PMCChargeType configured -- no rows created, logged,
+         reason=no_charge_type_configured.
+      3. PMCChargeType exists but inactive -- no rows created, logged,
+         reason=charge_type_inactive.
+      4. Duplicate sync (retry) -- exactly one JournalEntry,
+         reason=duplicate_skip on the second call.
+      5. Unresolved bounce still exists on the lease -- this function does
+         not post at all (mutually exclusive with post_bounce_fee).
+      6. Unresolvable PMC -- no rows created, logged, reason=unresolvable_pmc.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_leasetransaction (
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
+                    lease_id BIGINT NOT NULL,
+                    amount DOUBLE PRECISION,
+                    cheque_type VARCHAR(20) NOT NULL,
+                    payment_type VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT,
+                    cheque_date TIMESTAMP WITH TIME ZONE
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_lease (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS charges_charge (
+                    id BIGSERIAL PRIMARY KEY,
+                    amount DOUBLE PRECISION,
+                    vat_amount DOUBLE PRECISION NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS lease_leasetransaction")
+            cursor.execute("DROP TABLE IF EXISTS lease_lease")
+            cursor.execute("DROP TABLE IF EXISTS property_unit")
+            cursor.execute("DROP TABLE IF EXISTS property_property")
+            cursor.execute("DROP TABLE IF EXISTS charges_charge")
+        super().tearDownClass()
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            for table in (
+                "lease_leasetransaction",
+                "lease_lease",
+                "property_unit",
+                "property_property",
+                "charges_charge",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    def _make_profile(self, pmc_id=1):
+        return FinancePMCProfile.objects.create(
+            pmc_id=pmc_id,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+
+    def _insert_pmc_chain(self, cursor, lease_id, unit_id, property_id, pmc_id):
+        cursor.execute(
+            "INSERT INTO lease_lease (id, unit_id) VALUES (%s, %s)",
+            [lease_id, unit_id],
+        )
+        cursor.execute(
+            "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+            [unit_id, property_id],
+        )
+        cursor.execute(
+            "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+            [property_id, pmc_id],
+        )
+
+    def _insert_txn(
+        self,
+        cursor,
+        txn_id,
+        lease_id,
+        amount,
+        cheque_type,
+        status,
+        charge_id=None,
+    ):
+        cursor.execute(
+            """
+            INSERT INTO lease_leasetransaction
+                (documents_ptr_id, lease_id, amount, cheque_type, payment_type, status,
+                 charge_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            [txn_id, lease_id, amount, cheque_type, "CHEQUE", status, charge_id],
+        )
+
+    def _insert_charge(self, cursor, charge_id, amount, vat_amount=0):
+        cursor.execute(
+            "INSERT INTO charges_charge (id, amount, vat_amount) VALUES (%s, %s, %s)",
+            [charge_id, amount, vat_amount],
+        )
+
+    def test_other_charge_no_bounce_active_charge_type_posts_balanced_entry(self):
+        profile = self._make_profile(pmc_id=1)
+        maintenance_account = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Maintenance Income",
+            account_type=Account.INCOME,
+        )
+
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(
+                cursor, lease_id=10, unit_id=10, property_id=10, pmc_id=1
+            )
+            self._insert_charge(cursor, charge_id=500, amount=200, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=100,
+                lease_id=10,
+                amount=200,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                charge_id=500,
+            )
+
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile,
+            charge_id=500,
+            account=maintenance_account,
+            active=True,
+        )
+
+        result = post_other_charge(100)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=100,
+            source_status_transition="OTHER_CHARGE-POSTED",
+        )
+        self.assertEqual(entry.finance_pmc_profile_id, profile.id)
+        self.assertEqual(entry.source_type, JournalEntry.MANUAL)
+
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 2)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        income_line = lines.get(account__name="Maintenance Income")
+        self.assertEqual(ar_line.debit, 200)
+        self.assertEqual(ar_line.credit, 0)
+        self.assertEqual(income_line.debit, 0)
+        self.assertEqual(income_line.credit, 200)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 200)
+
+    def test_other_charge_with_vat_posts_balanced_three_line_entry(self):
+        profile = self._make_profile(pmc_id=2)
+        security_account = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Security Charge Income",
+            account_type=Account.INCOME,
+        )
+
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(
+                cursor, lease_id=20, unit_id=20, property_id=20, pmc_id=2
+            )
+            self._insert_charge(cursor, charge_id=501, amount=300, vat_amount=15)
+            self._insert_txn(
+                cursor,
+                txn_id=101,
+                lease_id=20,
+                amount=315,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                charge_id=501,
+            )
+
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile,
+            charge_id=501,
+            account=security_account,
+            active=True,
+        )
+
+        result = post_other_charge(101)
+
+        self.assertTrue(result["posted"])
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=101,
+            source_status_transition="OTHER_CHARGE-POSTED",
+        )
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        self.assertEqual(lines.count(), 3)
+
+        ar_line = lines.get(account__name="AR — Tenants")
+        income_line = lines.get(account__name="Security Charge Income")
+        vat_line = lines.get(account__name="VAT Payable")
+        self.assertEqual(ar_line.debit, 315)
+        self.assertEqual(income_line.credit, 300)
+        self.assertEqual(vat_line.credit, 15)
+
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 315)
+
+    def test_no_charge_type_configured_posts_nothing(self):
+        self._make_profile(pmc_id=3)
+
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(
+                cursor, lease_id=30, unit_id=30, property_id=30, pmc_id=3
+            )
+            self._insert_charge(cursor, charge_id=502, amount=100, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=102,
+                lease_id=30,
+                amount=100,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                charge_id=502,
+            )
+
+        result = post_other_charge(102)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "no_charge_type_configured")
+        self.assertEqual(JournalEntry.objects.filter(source_lease_transaction_id=102).count(), 0)
+
+    def test_inactive_charge_type_posts_nothing(self):
+        profile = self._make_profile(pmc_id=4)
+        account = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Maintenance Income",
+            account_type=Account.INCOME,
+        )
+
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(
+                cursor, lease_id=40, unit_id=40, property_id=40, pmc_id=4
+            )
+            self._insert_charge(cursor, charge_id=503, amount=100, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=103,
+                lease_id=40,
+                amount=100,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                charge_id=503,
+            )
+
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile,
+            charge_id=503,
+            account=account,
+            active=False,
+        )
+
+        result = post_other_charge(103)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "charge_type_inactive")
+        self.assertEqual(JournalEntry.objects.filter(source_lease_transaction_id=103).count(), 0)
+
+    def test_duplicate_sync_is_a_no_op_second_call(self):
+        profile = self._make_profile(pmc_id=5)
+        account = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Maintenance Income",
+            account_type=Account.INCOME,
+        )
+
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(
+                cursor, lease_id=50, unit_id=50, property_id=50, pmc_id=5
+            )
+            self._insert_charge(cursor, charge_id=504, amount=120, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=104,
+                lease_id=50,
+                amount=120,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                charge_id=504,
+            )
+
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile,
+            charge_id=504,
+            account=account,
+            active=True,
+        )
+
+        first_result = post_other_charge(104)
+        self.assertTrue(first_result["posted"])
+
+        second_result = post_other_charge(104)
+        self.assertFalse(second_result["posted"])
+        self.assertEqual(second_result["reason"], "duplicate_skip")
+
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                source_lease_transaction_id=104,
+                source_status_transition="OTHER_CHARGE-POSTED",
+            ).count(),
+            1,
+        )
+
+    def test_unresolved_bounce_on_lease_never_posts(self):
+        profile = self._make_profile(pmc_id=6)
+        account = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Maintenance Income",
+            account_type=Account.INCOME,
+        )
+
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(
+                cursor, lease_id=60, unit_id=60, property_id=60, pmc_id=6
+            )
+            # A bounced transaction on the same lease, still unresolved
+            # (status=BOUNCED, no accompanying reversal/pairing needed for
+            # this function's own gate -- it only checks
+            # bounced_ids_on_lease's emptiness, mirroring post_bounce_fee's
+            # own check verbatim).
+            self._insert_txn(
+                cursor,
+                txn_id=105,
+                lease_id=60,
+                amount=5000,
+                cheque_type="RENT_CHEQUE",
+                status="BOUNCED",
+            )
+            self._insert_charge(cursor, charge_id=505, amount=100, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=106,
+                lease_id=60,
+                amount=100,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                charge_id=505,
+            )
+
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile,
+            charge_id=505,
+            account=account,
+            active=True,
+        )
+
+        result = post_other_charge(106)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "unresolved_bounce_exists")
+        self.assertEqual(JournalEntry.objects.filter(source_lease_transaction_id=106).count(), 0)
+
+    def test_unresolvable_pmc_posts_nothing(self):
+        self._make_profile(pmc_id=7)
+
+        with connection.cursor() as cursor:
+            # lease_id=70 deliberately has no lease_lease row -- an
+            # unresolvable PMC chain from the very first hop.
+            self._insert_charge(cursor, charge_id=506, amount=100, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=107,
+                lease_id=70,
+                amount=100,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                charge_id=506,
+            )
+
+        result = post_other_charge(107)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "unresolvable_pmc")
+        self.assertEqual(JournalEntry.objects.filter(source_lease_transaction_id=107).count(), 0)
+
+    def test_not_other_charge_type_is_a_no_op(self):
+        self._make_profile(pmc_id=8)
+
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(
+                cursor, lease_id=80, unit_id=80, property_id=80, pmc_id=8
+            )
+            self._insert_txn(
+                cursor,
+                txn_id=108,
+                lease_id=80,
+                amount=5000,
+                cheque_type="RENT_CHEQUE",
+                status="BALANCE",
+            )
+
+        result = post_other_charge(108)
+
+        self.assertFalse(result["posted"])
+        self.assertEqual(result["reason"], "not_other_charge_type")
+
+    def test_posted_entry_satisfies_manual_entries_list_filter(self):
+        """Post-review addition (verification-gap finding): AC 1 requires
+        this posting to surface under Ledger Entries -> Manual Entries
+        (Story 5.1's list page), which filters strictly on
+        source_type=JournalEntry.MANUAL (see _list_manual_journal_entries).
+        Confirms the entry post_other_charge creates actually satisfies that
+        exact filter, so a future narrowing of it (e.g. also requiring
+        source_status_transition="") would be caught here."""
+        profile = self._make_profile(pmc_id=9)
+
+        with connection.cursor() as cursor:
+            self._insert_pmc_chain(
+                cursor, lease_id=90, unit_id=90, property_id=90, pmc_id=9
+            )
+            self._insert_charge(cursor, charge_id=901, amount=200, vat_amount=0)
+            self._insert_txn(
+                cursor,
+                txn_id=109,
+                lease_id=90,
+                amount=200,
+                cheque_type="OTHER_CHARGE",
+                status="BALANCE",
+                charge_id=901,
+            )
+
+        account = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Maintenance Income",
+            account_type=Account.INCOME,
+        )
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile, charge_id=901, account=account, active=True
+        )
+
+        result = post_other_charge(109)
+        self.assertTrue(result["posted"])
+
+        entry = JournalEntry.objects.get(source_lease_transaction_id=109)
+        # The exact filter _list_manual_journal_entries applies (spec AC 1:
+        # "visible under Ledger Entries -> Manual Entries").
+        self.assertTrue(
+            JournalEntry.objects.filter(
+                pk=entry.pk,
+                finance_pmc_profile=profile,
+                source_type=JournalEntry.MANUAL,
+            ).exists()
+        )
+
+
+class SyncLeaseTransactionOtherChargeDispatcherTests(TestCase):
+    """Story 5.2 tests: sync_lease_transaction's dispatcher wiring -- calls
+    post_other_charge after post_bounce_fee, only when the bounce-fee
+    result's reason is "no_unresolved_bounce" (spec Boundaries &
+    Constraints/Code Map). HTTP-level, mirroring
+    SyncLeaseTransactionRentPostingIntegrationTests' established pattern.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_leasetransaction (
+                    documents_ptr_id BIGSERIAL PRIMARY KEY,
+                    lease_id BIGINT NOT NULL,
+                    amount DOUBLE PRECISION,
+                    cheque_type VARCHAR(20) NOT NULL,
+                    payment_type VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL,
+                    created TIMESTAMP WITH TIME ZONE,
+                    charge_id BIGINT,
+                    cheque_date TIMESTAMP WITH TIME ZONE
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lease_lease (
+                    id BIGSERIAL PRIMARY KEY,
+                    unit_id BIGINT,
+                    lease_status VARCHAR(20),
+                    security_deposit DOUBLE PRECISION
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_unit (
+                    id BIGSERIAL PRIMARY KEY,
+                    parent_property_id BIGINT,
+                    property_block_tower_id BIGINT,
+                    commission_percent NUMERIC(5, 3)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS property_property (
+                    id BIGSERIAL PRIMARY KEY,
+                    pmc_id BIGINT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS charges_charge (
+                    id BIGSERIAL PRIMARY KEY,
+                    amount DOUBLE PRECISION,
+                    vat_amount DOUBLE PRECISION NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS lease_leasetransaction")
+            cursor.execute("DROP TABLE IF EXISTS lease_lease")
+            cursor.execute("DROP TABLE IF EXISTS property_unit")
+            cursor.execute("DROP TABLE IF EXISTS property_property")
+            cursor.execute("DROP TABLE IF EXISTS charges_charge")
+        super().tearDownClass()
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            for table in (
+                "lease_leasetransaction",
+                "lease_lease",
+                "property_unit",
+                "property_property",
+                "charges_charge",
+            ):
+                cursor.execute(f"DELETE FROM {table}")
+
+    @override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token")
+    def test_other_charge_sync_via_http_posts_after_no_unresolved_bounce(self):
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=9,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+        account = Account.objects.create(
+            finance_pmc_profile=profile,
+            name="Maintenance Income",
+            account_type=Account.INCOME,
+        )
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO lease_lease (id, unit_id) VALUES (%s, %s)", [90, 91]
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [91, 92],
+            )
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [92, 9],
+            )
+            cursor.execute(
+                "INSERT INTO charges_charge (id, amount, vat_amount) VALUES (%s, %s, %s)",
+                [700, 250, 0],
+            )
+            cursor.execute(
+                "INSERT INTO lease_leasetransaction "
+                "(documents_ptr_id, lease_id, amount, cheque_type, payment_type, "
+                "status, created, charge_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                [
+                    300,
+                    90,
+                    250,
+                    "OTHER_CHARGE",
+                    "CHEQUE",
+                    "BALANCE",
+                    "2026-01-01T00:00:00+00:00",
+                    700,
+                ],
+            )
+
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile,
+            charge_id=700,
+            account=account,
+            active=True,
+        )
+
+        response = self.client.post(
+            reverse("sync-lease-transaction", kwargs={"lease_transaction_id": 300}),
+            data={"lease_transaction_id": 300},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["content"]["posting"]["bounce_fee"],
+            {"posted": False, "reason": "no_unresolved_bounce"},
+        )
+        self.assertEqual(
+            body["content"]["posting"]["other_charge"],
+            {"posted": True, "reason": ""},
+        )
+
+        entry = JournalEntry.objects.get(
+            source_lease_transaction_id=300,
+            source_status_transition="OTHER_CHARGE-POSTED",
+        )
+        self.assertEqual(entry.finance_pmc_profile_id, profile.id)
+        lines = LedgerLine.objects.filter(journal_entry=entry)
+        debit_total = sum(line.debit for line in lines)
+        credit_total = sum(line.credit for line in lines)
+        self.assertEqual(debit_total, credit_total)
+        self.assertEqual(debit_total, 250)
+
+    @override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token")
+    def test_rent_cheque_sync_never_calls_other_charge(self):
+        """A RENT_CHEQUE transaction never triggers post_bounce_fee's
+        OTHER_CHARGE gate, so post_other_charge is never even attempted for
+        it (spec: the OTHER_CHARGE gate not applying at all correctly means
+        this function's own gate also won't apply)."""
+        FinancePMCProfile.objects.create(
+            pmc_id=10,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO lease_lease (id, unit_id) VALUES (%s, %s)", [100, 101]
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [101, 102],
+            )
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [102, 10],
+            )
+            cursor.execute(
+                "INSERT INTO lease_leasetransaction "
+                "(documents_ptr_id, lease_id, amount, cheque_type, payment_type, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                [301, 100, 5000, "RENT_CHEQUE", "CHEQUE", "BALANCE"],
+            )
+
+        response = self.client.post(
+            reverse("sync-lease-transaction", kwargs={"lease_transaction_id": 301}),
+            data={"lease_transaction_id": 301},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["content"]["posting"]["bounce_fee"],
+            {"posted": False, "reason": "not_other_charge_type"},
+        )
+        self.assertNotIn("other_charge", body["content"]["posting"])
+
+    @override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token")
+    def test_other_charge_never_called_when_bounce_fee_succeeds(self):
+        """Post-review addition (verification-gap finding): the only two
+        dispatcher scenarios previously tested were `no_unresolved_bounce`
+        and `not_other_charge_type` -- neither exercises the case where
+        post_bounce_fee actually pairs and posts. A regression widening the
+        exact-string gate (e.g. to `if not bounce_fee_result["posted"]`)
+        would have shipped undetected without this test."""
+        profile = FinancePMCProfile.objects.create(
+            pmc_id=11,
+            base_currency="AED",
+            country="UAE",
+            fiscal_year_start_month=1,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO lease_lease (id, unit_id) VALUES (%s, %s)", [110, 111]
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [111, 112],
+            )
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [112, 11],
+            )
+            # A prior RENT_CHEQUE transaction, posted then bounced -- gives
+            # post_bounce_fee an unresolved bounce to pair against.
+            cursor.execute(
+                "INSERT INTO lease_leasetransaction "
+                "(documents_ptr_id, lease_id, amount, cheque_type, payment_type, "
+                "status, created) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                [310, 110, 5000, "RENT_CHEQUE", "CHEQUE", "BALANCE",
+                 "2026-01-01T00:00:00+00:00"],
+            )
+        self.assertTrue(post_rent_ar(310)["posted"])
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE lease_leasetransaction SET status = 'BOUNCED' "
+                "WHERE documents_ptr_id = %s",
+                [310],
+            )
+        self.assertTrue(post_bounce_reversal(310)["posted"])
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO charges_charge (id, amount, vat_amount) VALUES (%s, %s, %s)",
+                [701, 150, 0],
+            )
+            cursor.execute(
+                "INSERT INTO lease_leasetransaction "
+                "(documents_ptr_id, lease_id, amount, cheque_type, payment_type, "
+                "status, created, charge_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                [311, 110, 150, "OTHER_CHARGE", "CHEQUE", "BALANCE",
+                 "2026-01-02T00:00:00+00:00", 701],
+            )
+
+        response = self.client.post(
+            reverse("sync-lease-transaction", kwargs={"lease_transaction_id": 311}),
+            data={"lease_transaction_id": 311},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["content"]["posting"]["bounce_fee"]["posted"])
+        self.assertNotIn("other_charge", body["content"]["posting"])
+
+        # Exactly one JournalEntry for the OTHER_CHARGE transaction -- via
+        # the bounce-fee path, never double-posted by post_other_charge.
+        self.assertEqual(
+            JournalEntry.objects.filter(source_lease_transaction_id=311).count(),
+            1,
+        )
+
+    @override_settings(FINANCE_INTERNAL_TOKEN="test-internal-token")
+    def test_other_charge_never_called_when_bounce_fee_reason_is_missing_created_timestamp(self):
+        """Post-review addition: confirms the dispatcher's gate is the
+        exact string "no_unresolved_bounce", not merely "not posted" --
+        post_bounce_fee's missing_created_timestamp failure (checked before
+        its own bounce-pairing lookup even runs) must not trigger
+        post_other_charge either."""
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO lease_lease (id, unit_id) VALUES (%s, %s)", [120, 121]
+            )
+            cursor.execute(
+                "INSERT INTO property_unit (id, parent_property_id) VALUES (%s, %s)",
+                [121, 122],
+            )
+            cursor.execute(
+                "INSERT INTO property_property (id, pmc_id) VALUES (%s, %s)",
+                [122, 12],
+            )
+            cursor.execute(
+                "INSERT INTO charges_charge (id, amount, vat_amount) VALUES (%s, %s, %s)",
+                [702, 150, 0],
+            )
+            # No `created` timestamp -- post_bounce_fee's own
+            # missing_created_timestamp check fires before its bounce-pairing
+            # lookup ever runs.
+            cursor.execute(
+                "INSERT INTO lease_leasetransaction "
+                "(documents_ptr_id, lease_id, amount, cheque_type, payment_type, "
+                "status, charge_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                [312, 120, 150, "OTHER_CHARGE", "CHEQUE", "BALANCE", 702],
+            )
+
+        response = self.client.post(
+            reverse("sync-lease-transaction", kwargs={"lease_transaction_id": 312}),
+            data={"lease_transaction_id": 312},
+            content_type="application/json",
+            HTTP_X_INTERNAL_TOKEN="test-internal-token",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["content"]["posting"]["bounce_fee"],
+            {"posted": False, "reason": "missing_created_timestamp"},
+        )
+        self.assertNotIn("other_charge", body["content"]["posting"])
+
+
+class PmcChargeTypeEndpointTests(TrialBalanceReportTests):
+    """Story 5.2 tests: POST/GET /ledger/pmc-charge-types (FR-17).
+
+    Subclasses TrialBalanceReportTests to reuse its stand-in-table
+    setUpClass/tearDownClass/setUp and its _make_profile/
+    _make_owner_with_pmc/_make_token helpers (mirrors
+    ManualJournalEntryEndpointTests' established precedent).
+    """
+
+    def _url(self):
+        return reverse("pmc-charge-types")
+
+    # Inherited from TrialBalanceReportTests but not applicable here.
+    def test_happy_path_returns_every_account_balanced_true(self):
+        self.skipTest("superseded by charge-type-shaped happy-path test below")
+
+    def test_zero_activity_account_included_with_zero_totals(self):
+        self.skipTest("not applicable -- no report/zero-activity concept here")
+
+    def test_reversal_entry_summed_unconditionally(self):
+        self.skipTest("not applicable -- this endpoint does not post reversals")
+
+    def test_unreachable_pmc_id_rejected_with_403(self):
+        self.skipTest("superseded by test_unauthorized_pmc_rejected_with_403 below")
+
+    def test_missing_date_range_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_invalid_date_format_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_inverted_date_range_rejected_with_400(self):
+        self.skipTest("not applicable -- this endpoint takes no date range")
+
+    def test_unauthenticated_request_rejected_with_401_before_any_query(self):
+        self.skipTest(
+            "superseded by test_unauthenticated_request_rejected_with_401 below"
+        )
+
+    def test_expired_token_rejected_with_401(self):
+        self.skipTest(
+            "covered by test_unauthenticated_request_rejected_with_401 below"
+        )
+
+    def _insert_charge_ref(self, charge_id, amount=100, vat_amount=0):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS charges_charge ("
+                "id BIGINT PRIMARY KEY, amount DOUBLE PRECISION, "
+                "vat_amount DOUBLE PRECISION NOT NULL DEFAULT 0)"
+            )
+            cursor.execute(
+                "INSERT INTO charges_charge (id, amount, vat_amount) VALUES (%s, %s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
+                [charge_id, amount, vat_amount],
+            )
+
+    def test_create_charge_type_happy_path(self):
+        profile = self._make_profile(pmc_id=60)
+        token = self._make_token("owner60@example.com")
+        self._make_owner_with_pmc(
+            60, "owner60@example.com", token, 260, unit_id=61, property_id=62, pmc_id=60
+        )
+        account = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+        self._insert_charge_ref(9001, amount=100, vat_amount=0)
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 60,
+                "charge_id": 9001,
+                "account_id": account.id,
+                "active": True,
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body["content"]["charge_id"], 9001)
+        self.assertEqual(body["content"]["account_id"], account.id)
+        self.assertTrue(body["content"]["active"])
+
+        self.assertEqual(
+            PMCChargeType.objects.filter(
+                finance_pmc_profile=profile, charge_id=9001
+            ).count(),
+            1,
+        )
+
+    def test_create_charge_type_upserts_existing_mapping(self):
+        profile = self._make_profile(pmc_id=61)
+        token = self._make_token("owner61@example.com")
+        self._make_owner_with_pmc(
+            61, "owner61@example.com", token, 261, unit_id=63, property_id=64, pmc_id=61
+        )
+        rent_income = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+        bank = Account.objects.get(finance_pmc_profile=profile, name="Bank")
+        self._insert_charge_ref(9002, amount=50, vat_amount=0)
+
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile,
+            charge_id=9002,
+            account=rent_income,
+            active=True,
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 61,
+                "charge_id": 9002,
+                "account_id": bank.id,
+                "active": False,
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            PMCChargeType.objects.filter(
+                finance_pmc_profile=profile, charge_id=9002
+            ).count(),
+            1,
+        )
+        updated = PMCChargeType.objects.get(
+            finance_pmc_profile=profile, charge_id=9002
+        )
+        self.assertEqual(updated.account_id, bank.id)
+        self.assertFalse(updated.active)
+
+    def test_missing_required_fields_rejected_with_400(self):
+        profile = self._make_profile(pmc_id=62)
+        token = self._make_token("owner62@example.com")
+        self._make_owner_with_pmc(
+            62, "owner62@example.com", token, 262, unit_id=65, property_id=66, pmc_id=62
+        )
+
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 62},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_unauthorized_pmc_rejected_with_403(self):
+        profile = self._make_profile(pmc_id=63)
+        other_token = self._make_token("stranger63@example.com")
+        # Owner is scoped to pmc_id=164, not pmc_id=63.
+        self._make_owner_with_pmc(
+            263, "stranger63@example.com", other_token, 363, unit_id=71, property_id=72, pmc_id=164
+        )
+        account = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+        self._insert_charge_ref(9003, amount=100, vat_amount=0)
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 63,
+                "charge_id": 9003,
+                "account_id": account.id,
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {other_token}",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_nonexistent_pmc_id_rejected_with_404(self):
+        token = self._make_token("owner64@example.com")
+        self._make_owner_with_pmc(
+            264, "owner64@example.com", token, 364, unit_id=73, property_id=74, pmc_id=999999
+        )
+
+        response = self.client.post(
+            self._url(),
+            {
+                "pmc_id": 999999,
+                "charge_id": 1,
+                "account_id": 1,
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_unauthenticated_request_rejected_with_401(self):
+        response = self.client.post(
+            self._url(),
+            {"pmc_id": 1, "charge_id": 1, "account_id": 1},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_list_endpoint_returns_created_charge_types(self):
+        profile = self._make_profile(pmc_id=65)
+        token = self._make_token("owner65@example.com")
+        self._make_owner_with_pmc(
+            65, "owner65@example.com", token, 265, unit_id=67, property_id=68, pmc_id=65
+        )
+        account = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+        self._insert_charge_ref(9004, amount=100, vat_amount=0)
+
+        PMCChargeType.objects.create(
+            finance_pmc_profile=profile,
+            charge_id=9004,
+            account=account,
+            active=True,
+        )
+
+        response = self.client.get(
+            self._url(),
+            {"pmc_id": 65},
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        charge_types = body["content"]["charge_types"]
+        self.assertEqual(len(charge_types), 1)
+        self.assertEqual(charge_types[0]["charge_id"], 9004)
+        self.assertEqual(charge_types[0]["account_id"], account.id)
+        self.assertTrue(charge_types[0]["active"])
+
+    def test_no_trailing_slash_url_also_works(self):
+        profile = self._make_profile(pmc_id=66)
+        token = self._make_token("owner66@example.com")
+        self._make_owner_with_pmc(
+            66, "owner66@example.com", token, 266, unit_id=69, property_id=70, pmc_id=66
+        )
+        account = Account.objects.get(
+            finance_pmc_profile=profile, name="Rent Income"
+        )
+        self._insert_charge_ref(9005, amount=100, vat_amount=0)
+
+        response = self.client.post(
+            reverse("pmc-charge-types-no-slash"),
+            {
+                "pmc_id": 66,
+                "charge_id": 9005,
+                "account_id": account.id,
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {token}",
+        )
+
+        self.assertEqual(response.status_code, 201)
