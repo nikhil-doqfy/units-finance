@@ -9,7 +9,9 @@ from ledger.views import (
     balance_sheet_report,
     bank_statement_import,
     chart_of_accounts,
+    create_manual_journal_entry,
     finance_pmc_profile_status,
+    pmc_charge_types,
     profit_loss_report,
     suggested_matches,
     sync_lease,
@@ -174,5 +176,36 @@ urlpatterns = [
         'finance-pmc-profile/<int:pmc_id>/status',
         finance_pmc_profile_status,
         name='finance-pmc-profile-status-no-slash',
+    ),
+    # Story 5.1 / FR-16: Manual journal entries -- trailing-slash + no-slash
+    # pair, matching the established route-pair convention above (spec Code
+    # Map). POST creates a balanced manual entry; GET lists existing ones
+    # for the PMC (both share the same path, dispatched by HTTP method via
+    # @api_view, matching no other existing Finance route -- but this is the
+    # first Finance resource needing both a create and a list on one path).
+    path(
+        'ledger/manual-entries/',
+        create_manual_journal_entry,
+        name='create-manual-journal-entry',
+    ),
+    path(
+        'ledger/manual-entries',
+        create_manual_journal_entry,
+        name='create-manual-journal-entry-no-slash',
+    ),
+    # Story 5.2 / FR-17: PMC charge type <-> Account mappings -- trailing-
+    # slash + no-slash pair, matching the established route-pair convention
+    # above (spec Code Map). POST creates/updates a mapping row; GET lists
+    # existing ones for the PMC (both share the same path, mirroring
+    # Story 5.1's manual-entries route).
+    path(
+        'ledger/pmc-charge-types/',
+        pmc_charge_types,
+        name='pmc-charge-types',
+    ),
+    path(
+        'ledger/pmc-charge-types',
+        pmc_charge_types,
+        name='pmc-charge-types-no-slash',
     ),
 ]
